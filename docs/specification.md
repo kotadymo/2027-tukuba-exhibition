@@ -1,13 +1,13 @@
 # 動体展示用 AI 物体検出・アラートシステム 仕様書
 
-- **仕様バージョン:** 0.3.0
+- **仕様バージョン:** 0.4.0
 - **作成日:** 2026-11-07
 - **対象リポジトリ:** [kotadymo/2027-tukuba-exhibition](https://github.com/kotadymo/2027-tukuba-exhibition)
 - **状態:** 初期実装向け確定仕様（性能値は実機計測後に調整）
 
 ## 1. 目的とスコープ
 
-カメラ映像を FastAPI の Backend で受信し、アップロードされた学習済みカスタム YOLO モデル（`.pt`）で物体検出する。ユーザーが設定した**複数の物体クラスが同一フレーム内にすべて存在する**場合にアラートを発報し、React の Frontend に映像・検出ボックス・警告を表示する。
+RTSP カメラ映像、または Frontend からアップロードした動画ファイルを FastAPI の Backend で受信・読み込みし、アップロードされた学習済みカスタム YOLO モデル（`.pt`）で物体検出する。ユーザーが設定した**複数の物体クラスが同一フレーム内にすべて存在する**場合にアラートを発報し、React の Frontend に映像・検出ボックス・警告を表示する。
 
 本番用システムのコア機能を展示向けに切り出すが、本仕様の優先順位は **デモとしての分かりやすさ、動作の安定性、実装の単純さ** とする。
 
@@ -19,9 +19,10 @@
 | Frontend | React / Vite（**既存の JSX 構成を維持**） |
 | データベース | SQLite |
 | カメラ | Raspberry Pi または Seeed Studio reCamera |
-| 映像入力 | RTSP を共通インターフェースとする |
+| 映像入力 | RTSP カメラまたはアップロードした動画ファイルを選択（排他） |
 | YOLO モデル | Ultralytics で読み込める、物体検出用のカスタム `.pt` |
 | モデル登録 | Frontend からアップロード／一覧表示／有効化／削除 |
+| 動画入力 | Frontend から MP4 をアップロード、選択・再生・一時停止・先頭から再生・ループ再生 |
 | 推論環境 | **CPU のみ**（CUDA/GPU は初期スコープ外） |
 | アラート条件 | 同一の推論フレームに、選択されたすべてのクラスが出現（AND） |
 | アラート手段 | ブラウザ内の警告表示＋展示 PC の音声 |
@@ -36,11 +37,14 @@
 ## 2. 全体構成
 
 ~~~text
-Raspberry Pi Camera / reCamera
-        │ RTSP（LAN）
-        ▼
+Raspberry Pi Camera / reCamera       アップロード MP4 動画
+        │ RTSP（LAN）                    │ Frontend → REST
+        └───────────────┬───────────────┘
+                        ▼
 Backend: FastAPI
+ ├─ SourceService        RTSP / ファイルの入力切り替え
  ├─ CameraService        RTSP 接続・取得・再接続
+ ├─ VideoService         MP4 保存・再生・ループ・時刻管理
  ├─ InferenceService     YOLO(.pt) / CPU 推論
  ├─ ModelService         .pt ファイルの保存・登録・切り替え
  ├─ RuleEngine           同一フレーム AND 判定・連続検出・解除
@@ -66,11 +70,13 @@ Backend はカメラ映像を一元的に取得し、Frontend は RTSP へ直接
 - Raspberry Pi: カメラモジュールと RTSP 配信ソフトウェアを別途構成する。
 - reCamera: 利用する機種・ファームウェアの RTSP 配信機能を使用する。
 - Backend 側は機種名による分岐を原則設けず、共通の RTSP URL で接続する。
-- 開発・テスト用にローカル動画ファイル入力にも対応する（展示時は RTSP を使用）。
+- Raspberry Pi 側の準備ができる前でも展示できるよう、Frontend からアップロードした動画ファイルを**正式な入力モード**として利用できる（展示時も使用可能）。
 
 ### 3.2 カメラ操作
 
 Frontend で接続 URL を登録・更新し、接続開始／切断を操作できる。接続状況を `connecting` / `connected` / `disconnected` / `error` として表示する。
+
+入力ソースは `rtsp` / `video` を排他的に選択する。モードを切り替える際は前の入力・推論処理を停止し、検出結果とアラート状態をクリアしたうえで新しい入力を開始する。
 
 カメラ切断時は自動再接続を試みる（初期値 3 秒間隔）。切断中は古い検出ボックスを消し、アラートルールの継続判定を停止する。
 
@@ -81,6 +87,41 @@ Frontend で接続 URL を登録・更新し、接続開始／切断を操作で
 - 推論が追いつかない場合、待機フレームをため込まず破棄する（キュー長は最大 1）。
 - 最初の実装では**推論に使ったフレームとその検出結果を対として WebSocket 配信**する。異なる時刻の画像にボックスがずれて描かれる問題を避けるため、表示更新 FPS は推論 FPS に準じる。
 - 表示 FPS を推論 FPS と独立させる高速プレビュー（WebRTC 等）は将来拡張とする。
+- 動画ファイルモードでも同一の InferenceService / RuleEngine を使用する。入力ソースの時間管理と再生操作は 3.4 に従う。
+
+### 3.4 アップロード動画によるデモ再生（追加機能）
+
+**目的:** Raspberry Pi / reCamera が未完成でも、用意した動画に対する YOLO 推論、Bounding Box 表示、アラートルール判定を本番と同じ画面でデモできるようにする。
+
+#### 3.4.1 ファイル登録と管理
+
+- Frontend から動画ファイルをアップロードし、Backend の `data/videos/` に保存する。
+- **初期対応形式は MP4（H.264 を推奨）**。MP4 コンテナであっても環境のデコーダーが非対応のコーデックはエラー表示とする。
+- アップロード上限の初期値は **1 GiB** とし、必要に応じて設定で変更可能とする。
+- 拡張子とサイズを確認した後、OpenCV / FFmpeg で開き、先頭フレームのデコード可否、解像度、FPS、総フレーム数（取得できる場合）を確認する。
+- 登録済み動画の**一覧表示・選択・削除**に対応する。名前、ファイルサイズ、解像度、FPS、再生時間を表示する（取得できないメタデータは「不明」）。
+- アップロードに成功した動画は選択状態にする。**再生開始はユーザーの再生ボタン操作**による。登録中／検証中は現在の入力・推論を停止しない。
+- 使用中（再生中）の動画は削除できない。動画ファイル本体は SQLite に格納しない。
+
+#### 3.4.2 再生操作
+
+- 入力モードを「カメラ（RTSP）」または「アップロード動画」から選択する。
+- 動画モードでは、**再生／一時停止／先頭から再生／停止**ができる。
+- **ループ再生は初期値 ON**。OFF の場合、末尾に達したら停止し「再生終了」と表示する。
+- 再生中は動画名、再生位置／全体時間、再生状態（`ready` / `playing` / `paused` / `ended` / `error`）を表示する。
+- 初期版では**シークバーでの任意位置へのジャンプや再生速度変更、元動画の音声再生は対象外**とする（再生位置は表示のみ）。
+- 再生中に別動画を選択した場合は、現在の再生を停止して新動画を先頭から準備する。
+
+#### 3.4.3 フレーム・推論同期
+
+- 動画ファイルは Backend がデコードする。**Frontend が元動画を単独で再生してボックスだけを重ねる構成にはしない**。
+- RTSP と同じ YOLO 推論パイプラインへフレームを渡し、**推論に使ったフレームの JPEG と同フレームの Bounding Box をまとめて WebSocket 送信**する。
+- 初期版は動画の原則 **1 倍速相当**を目指して、動画内時刻（PTS、取得できない場合はフレーム番号と FPS）を基準に処理タイミングを管理する。CPU が追いつかないときは古いフレームを間引き、遅延を蓄積させない。
+- 動画再生中のアラート継続判定時間は、**動画内時刻**で測定する。ただし連続判定は実際に推論したフレーム間でのみ行う。間引いたフレームでの物体有無は保証しない。
+- 同一フレームの画像と検出結果を表示するため、映像だけが先行したり Bounding Box がずれることを避ける。
+- 一時停止時は最後のフレームとボックスを残して「一時停止中」と表示し、新しいアラートを発報しない。再開時は継続判定状態をリセットする。
+- 停止、先頭から再生、入力切り替え、ループ先頭では、アラート判定状態とクールダウン時刻をリセットする。ループのたびに同じ場面で再発報可能とする。
+- 動画の音声は再生せず、**警告音のみ**ブラウザで鳴らす。
 
 ## 4. YOLO モデル管理
 
@@ -131,7 +172,7 @@ Backend は `data/models/` にファイルを保存し、次を確認する。
 | Batch Size | `1` | 固定 |
 | カメラ画像サイズ | カメラの配信設定に依存 | 初期評価は 1280×720 を想定 |
 
-検出データは `frame_id`、`timestamp`、`class_id`、`class_name`、`confidence`、`bbox=[x1,y1,x2,y2]` を含む。`bbox` は**配信 JPEG 画像のピクセル座標**とする。
+検出データは `frame_id`、`timestamp`、`class_id`、`class_name`、`confidence`、`bbox=[x1,y1,x2,y2]` を含む。動画入力では再生位置を示す `media_time_ms` も付与する。`bbox` は**配信 JPEG 画像のピクセル座標**とする。
 
 UI には実測推論 FPS、処理時間（ms）、モデル名、カメラの状態を表示する。
 
@@ -163,11 +204,11 @@ CPU 性能とモデル規模によって実際の FPS が変動するため、�
 
 1. 各 YOLO 推論フレームから、Confidence 閾値を満たすクラス名集合を作る。
 2. ルールの全クラス名が含まれていれば、そのフレームは条件成立とする。
-3. **連続 2 推論フレーム以上**かつ**最初の成立から 0.5 秒以上**続いた時点で 1 回発報する。
+3. **連続 2 推論フレーム以上**かつ**最初の成立から 0.5 秒以上**続いた時点で 1 回発報する。時間軸は RTSP ではフレーム取得時の単調時計、アップロード動画では動画内時刻を用いる。
 4. `active` 中は同一ルールのアラートを連発しない。
 5. 条件が **2.0 秒連続で不成立**になったら解除して `idle` に戻す。
 6. 前回の発報から **10 秒**のクールダウン中は再発報しない（成立状態は画面表示できる）。
-7. カメラ切断、推論停止、モデル切り替え時は `pending` / `active` をクリアする。
+7. カメラ切断、動画停止・一時停止・再開・ループ・入力切り替え、推論停止、モデル切り替え時は `pending` / `active` をクリアする。
 8. 推論結果が 2 秒以上届かなければ継続成立とは扱わず、画面にストリーム異常を示す。
 
 初期値は `detection_duration_ms=500`、`release_duration_ms=2000`、`cooldown_ms=10000` とし、ルールごとに変更できる。クールダウンは最終発報時刻を基準とする。
@@ -186,10 +227,11 @@ PC からの警告音はブラウザで再生する。ブラウザの自動再�
 
 1920×1080 の PC／展示モニターを主な対象とし、1 画面で以下を操作・確認できる。
 
-- **映像エリア:** ライブ映像、Bounding Box、クラス名、Confidence、検出対象の強調。
+- **映像エリア:** カメラ／動画の映像、Bounding Box、クラス名、Confidence、検出対象の強調。
 - **アラートルール:** ルール一覧、ON/OFF、新規追加、編集、削除、モデル不一致表示。
 - **警告エリア:** 発報中ルール、警告バナー、発報時刻、音声 ON/OFF、テスト発報。
 - **状態エリア:** カメラ接続、Backend 接続、モデル名、実測推論 FPS、推論時間。
+- **動画入力操作:** 入力モード切り替え、動画アップロード、一覧選択、再生／一時停止／停止／先頭から再生、ループ ON/OFF、再生位置表示。
 - **ナビゲーション:** モデル管理、カメラ／推論設定、アラート履歴。
 
 初期版では Canvas を用いて JPEG フレームの上に検出ボックスを描く。映像の縦横比を維持し、リサイズ時は座標を映像の表示倍率に合わせて変換する。
@@ -203,7 +245,7 @@ PC からの警告音はブラウザで再生する。ブラウザの自動再�
 
 ### 7.3 設定画面
 
-- RTSP URL と接続操作。
+- RTSP URL と接続操作、または登録済み動画の選択。
 - Confidence、NMS IoU、`imgsz`、目標 FPS。
 - ボックス・ラベル・Confidence の表示切り替え。
 - 警告音 ON/OFF。
@@ -212,7 +254,7 @@ PC からの警告音はブラウザで再生する。ブラウザの自動再�
 
 ### 7.4 エラー表示
 
-未接続、モデル未選択、モデル不一致、推論エラー、WebSocket 切断を日本語で明示し、過去のフレームを正常稼働中のように表示し続けない。
+未接続、モデル未選択、モデル不一致、動画のデコード失敗・再生終了、推論エラー、WebSocket 切断を日本語で明示し、過去のフレームを正常稼働中のように表示し続けない。
 
 ## 8. API 仕様
 
@@ -225,6 +267,14 @@ PC からの警告音はブラウザで再生する。ブラウザの自動再�
 | PATCH | `/api/camera` | 映像入力種別・URL の更新 |
 | POST | `/api/camera/connect` | カメラ接続開始 |
 | POST | `/api/camera/disconnect` | カメラ切断 |
+| GET | `/api/videos` | 登録済み動画一覧 |
+| POST | `/api/videos` | `multipart/form-data` による MP4 アップロード |
+| GET | `/api/videos/{id}` | 動画メタデータ |
+| POST | `/api/videos/{id}/activate` | 動画を選択し入力モードを video に切り替える |
+| DELETE | `/api/videos/{id}` | 未再生の登録済み動画を削除 |
+| GET | `/api/videos/playback` | 現在の動画・再生状態・位置を取得 |
+| POST | `/api/videos/playback` | `{"action":"play|pause|restart|stop"}` で再生を操作 |
+| PATCH | `/api/videos/playback` | `{"loop":true|false}` でループ設定 |
 | GET | `/api/models` | モデル一覧 |
 | POST | `/api/models` | `multipart/form-data` による .pt 登録 |
 | GET | `/api/models/{id}` | モデル詳細とクラス |
@@ -248,8 +298,8 @@ PC からの警告音はブラウザで再生する。ブラウザの自動再�
 初期版は**推論済みフレームと検出結果の同期**を優先して単一 WebSocket を使用する。
 
 - **フレーム（バイナリ）:** `uint32_le(header_length)` + `UTF-8 JSON header` + `JPEG bytes`。
-- JSON header には `type="frame"`、`frame_id`、`timestamp`、`width`、`height`、`detections`、`matched_rule_ids` を含む。
-- **イベント（テキスト JSON）:** `type="alert_started"` / `"alert_cleared"` / `"camera_status"` / `"model_changed"` / `"error"`。
+- JSON header には `type="frame"`、`frame_id`、`timestamp`、`source_type`（`rtsp` / `video`）、動画モード時の `media_time_ms` と `video_id`、`width`、`height`、`detections`、`matched_rule_ids` を含む。
+- **イベント（テキスト JSON）:** `type="alert_started"` / `"alert_cleared"` / `"camera_status"` / `"video_status"` / `"source_changed"` / `"model_changed"` / `"error"`。
 - Frontend は受け取った 1 つのフレームメッセージから JPEG と検出結果を同時に描画する。フレーム ID は受信元フレームを識別する単調増加整数とする。
 - WebSocket 切断時、Frontend は自動再接続する。再接続後は REST API から現在の設定と履歴を再取得する。
 
@@ -260,6 +310,9 @@ PC からの警告音はブラウザで再生する。ブラウザの自動再�
   "type": "frame",
   "frame_id": 1234,
   "timestamp": "2026-11-07T18:30:00+09:00",
+  "source_type": "video",
+  "video_id": 1,
+  "media_time_ms": 2400,
   "width": 640,
   "height": 360,
   "detections": [
@@ -296,10 +349,11 @@ SQLite は 1 ファイル（`data/app.db`）で運用する。テーブルは下
 | `models` | `id, name, original_filename, stored_filename, file_size, created_at` |
 | `model_classes` | `id, model_id, class_id, class_name` |
 | `model_settings` | `id, active_model_id, confidence, iou_threshold, imgsz, target_fps` |
-| `camera_settings` | `id, source_type, rtsp_url, video_path` |
+| `camera_settings` | `id, source_type, rtsp_url, active_video_id, loop_enabled` |
+| `videos` | `id, name, original_filename, stored_filename, file_size, width, height, fps, duration_ms, created_at` |
 | `alert_rules` | `id, name, enabled, detection_duration_ms, release_duration_ms, cooldown_ms, created_at, updated_at` |
 | `alert_rule_classes` | `id, rule_id, class_name` |
-| `alert_events` | `id, rule_id, model_id, rule_name_snapshot, detected_classes_json, event_type, created_at` |
+| `alert_events` | `id, rule_id, model_id, rule_name_snapshot, detected_classes_json, event_type, source_type, video_id, media_time_ms, created_at` |
 | `app_settings` | `key, value_json` |
 
 - `model_settings` / `camera_settings` は単一レコード運用。
@@ -307,7 +361,7 @@ SQLite は 1 ファイル（`data/app.db`）で運用する。テーブルは下
 - `alert_rule_classes` はクラス名で参照する。
 - `alert_events` はルール／モデル削除後も表示可能なスナップショット項目を保持する。
 - `app_settings` に音声 ON/OFF など共通 UI 設定を保持する。
-- モデル本体、映像、検出フレームは SQLite に保存しない。
+- モデル本体、アップロード動画本体、映像、検出フレームは SQLite に保存しない。アップロード動画本体は `data/videos/` に保存する。
 - SQLite は WAL モードを推奨する。
 
 ## 10. 非機能要件
@@ -316,14 +370,14 @@ SQLite は 1 ファイル（`data/app.db`）で運用する。テーブルは下
 
 - 目標推論 FPS: **5 FPS**（暫定、保証値ではない）。
 - 初期 `imgsz`: **416**。必要に応じ 320/640 等で調整する。
-- 目標はアラート判定が遅れて累積しないこと。最新フレーム優先とする。
+- 目標はアラート判定が遅れて累積しないこと。最新フレーム優先とし、動画再生時は動画内時刻を基準に古いフレームを間引く。
 - モデル読み込みや切り替え処理中も FastAPI の API 応答をブロックしない。
 - 推論は別ワーカー（スレッドまたはプロセス）で実行し、WebSocket 送信は非同期で扱う。
 - 使用 CPU 型番・モデルサイズが未確定のため、最終 FPS と端末要件は実機確認後に調整する。
 
 ### 10.2 安定動作
 
-- RTSP 再接続、WebSocket 再接続。
+- RTSP 再接続、WebSocket 再接続。動画末尾・デコードエラー時は適切に停止・ループ・エラー表示を行う。
 - モデル切り替えに失敗した場合、元の有効モデルを維持する。
 - Backend 再起動後にカメラ URL、使用モデル、ルール、設定を復元する。
 - 稼働状態／推論エラーを画面で確認可能とする。
@@ -331,7 +385,7 @@ SQLite は 1 ファイル（`data/app.db`）で運用する。テーブルは下
 
 ### 10.3 スコープ外
 
-GPU/CUDA 推論、複数カメラ、複数モデル同時推論、物体追跡、物体間の距離／接触／包含判定、ROI、録画、静止画保存、モデルの再学習、クラウド連携、外部ブザー／警告灯、メール通知、ログイン／認証システムは対象外。
+GPU/CUDA 推論、複数カメラ、複数モデル同時推論、物体追跡、物体間の距離／接触／包含判定、ROI、録画、静止画保存、動画の任意位置シーク、動画再生速度変更、動画の元音声再生、モデルの再学習、クラウド連携、外部ブザー／警告灯、メール通知、ログイン／認証システムは対象外。
 
 ## 11. 既存リポジトリとの整合性
 
@@ -352,6 +406,7 @@ GPU/CUDA 推論、複数カメラ、複数モデル同時推論、物体追跡�
 │   └── app/
 │       ├── api/
 │       ├── camera/
+│       ├── videos/
 │       ├── detection/
 │       ├── models/
 │       ├── rules/
@@ -367,13 +422,14 @@ GPU/CUDA 推論、複数カメラ、複数モデル同時推論、物体追跡�
 │       └── services/
 ├── data/
 │   ├── models/           # 実行時の .pt ファイル
+│   ├── videos/           # アップロードした動画ファイル
 │   └── app.db            # 実行時の SQLite
 ├── docs/
 │   └── specification.md  # 本書
 └── README.md
 ~~~
 
-`data/` 以下は実行時に生成し、モデルと DB は Git 管理対象外にすることを推奨する（実装時に `.gitignore` を確認・追記する）。
+`data/` 以下は実行時に生成し、モデル・動画・DB は Git 管理対象外にすることを推奨する（実装時に `.gitignore` を確認・追記する）。
 
 ## 12. 開発フェーズと受け入れ基準
 
@@ -381,7 +437,7 @@ GPU/CUDA 推論、複数カメラ、複数モデル同時推論、物体追跡�
 
 1. SQLite のスキーマ作成。
 2. `.pt` アップロード、登録、切り替え、クラス一覧 API。
-3. RTSP／動画ファイル入力。
+3. RTSP 入力と、Frontend からの MP4 アップロード・一覧・選択・再生 API。
 4. CPU での YOLO 推論と検出結果生成。
 
 ### Phase 2: Frontend とリアルタイム表示
@@ -389,6 +445,7 @@ GPU/CUDA 推論、複数カメラ、複数モデル同時推論、物体追跡�
 1. WebSocket フレーム配信。
 2. React ダッシュボードと Bounding Box。
 3. モデル管理画面とカメラ／推論設定。
+4. 動画アップロード、RTSP／動画入力の切り替え、再生・一時停止・ループ操作。
 
 ### Phase 3: アラートと展示確認
 
@@ -400,6 +457,11 @@ GPU/CUDA 推論、複数カメラ、複数モデル同時推論、物体追跡�
 ### 完了判定（最小受け入れ試験）
 
 - [ ] Raspberry Pi または reCamera の RTSP 映像が表示される。
+- [ ] Raspberry Pi が未完成でも、Frontend から MP4 をアップロード・選択し、動画を表示できる。
+- [ ] 動画の再生・一時停止・停止・先頭から再生とループ ON/OFF が機能する。
+- [ ] アップロード動画の各表示フレームに、同フレームの YOLO 検出ボックスが重なり、アラートルールも動作する。
+- [ ] CPU が動画 FPS に追いつかない場合、処理遅延が累積せず、映像とボックスがずれない。
+- [ ] 動画の再開・ループ・入力切り替え時に古いアラート状態が持ち越されない。
 - [ ] Frontend からカスタム `.pt` を登録でき、クラス一覧が表示される。
 - [ ] 登録済みモデルを画面から切り替えられる。
 - [ ] CPU のみで推論し、同じフレームに合う Bounding Box が描画される。
@@ -414,4 +476,4 @@ GPU/CUDA 推論、複数カメラ、複数モデル同時推論、物体追跡�
 
 ---
 
-**未確定事項:** 展示 PC の CPU 型番、使用する `.pt` モデルの規模、使用する Raspberry Pi/reCamera の具体的な機種と RTSP URL。これらは初期開発のブロッカーとせず、実機評価時に確定する。
+**未確定事項:** 展示 PC の CPU 型番、使用する `.pt` モデルの規模、使用する Raspberry Pi/reCamera の具体的な機種と RTSP URL、動画で使用する具体的なコーデックとサイズ。これらは初期開発のブロッカーとせず、実機評価時に確定する。
