@@ -1,6 +1,6 @@
 # 動体展示用 AI 物体検出・アラートシステム 仕様書
 
-- **仕様バージョン:** 0.5.0
+- **仕様バージョン:** 0.5.1
 - **更新日:** 2026-11-08
 - **対象リポジトリ:** [kotadymo/2027-tukuba-exhibition](https://github.com/kotadymo/2027-tukuba-exhibition)
 - **状態:** 実装用仕様（Insta360 GO Ultra の接続部分は実機検証が必要）
@@ -18,7 +18,7 @@ React の画面に映像と Bounding Box を表示し、設定された複数の
 | Backend | Python / FastAPI |
 | Frontend | React / Vite（既存リポジトリの JavaScript / JSX 構成を維持） |
 | DB | SQLite / SQLAlchemy |
-| ライブ映像入力 | Insta360 GO Ultra（Wi-Fi、非公式 Python ツールキットを利用する方針） |
+| ライブ映像入力 | Insta360 GO Ultra（Wi-Fi）、[Daiki-Iijima/insta360-go-ultra-sdk](https://github.com/Daiki-Iijima/insta360-go-ultra-sdk) を採用 |
 | 動画ファイル入力 | Frontend からアップロードする MP4（H.264 推奨） |
 | 入力ソース | `insta360` と `video` の **2 種類を排他的に切り替え** |
 | モデル | Ultralytics 互換の物体検出用カスタム `.pt`、Frontend から登録／切り替え |
@@ -80,16 +80,16 @@ YOLO、ルール判定、履歴保存は入力ソースに依存しない共通�
 
 ## 3. Insta360 GO Ultra ライブ入力
 
-### 3.1 非公式ライブラリの候補と前提
+### 3.1 採用する非公式ライブラリと前提
 
-利用候補は次の公開リポジトリとする。
+**採用ライブラリは次の公開リポジトリで確定**とする。
 
 - **[Daiki-Iijima/insta360-go-ultra-sdk](https://github.com/Daiki-Iijima/insta360-go-ultra-sdk)**
 - 参考資料: [README](https://github.com/Daiki-Iijima/insta360-go-ultra-sdk/blob/main/README.md) / [通信仕様](https://github.com/Daiki-Iijima/insta360-go-ultra-sdk/blob/main/docs/protocol.md)
 
 同リポジトリの説明では、GO Ultra の Wi-Fi アクセスポイントに接続し、**TCP 6666 番ポートの独自プロトコル**で映像を取得する。映像は **H.265 / HEVC Annex B** 形式で、Python スクリプトが動画バイト列を標準出力へ流せる。これは **RTSP ではない**。
 
-次は**候補 SDK に基づく設計値**であり、実機動作の保証ではない。
+次は**採用 SDK の公開情報に基づく設計値**であり、実機動作の保証ではない。
 
 | 項目 | 初期方針 |
 | --- | --- |
@@ -100,7 +100,7 @@ YOLO、ルール判定、履歴保存は入力ソースに依存しない共通�
 | デコード | FFmpeg を介して動画フレームを取得 |
 | 実装方法 | 非公式 SDK の映像受信処理を `Insta360Source` にラップする |
 
-**使用する非公式リポジトリの最終指定、利用許諾、GO Ultra 実機ファームウェア／Windows 対応は要確認。** SDK の README にある動作確認は macOS／Raspberry Pi OS と特定ファームウェアであり、Windows での動作を確認できたわけではない。互換性がない場合は同じ抽象インターフェースを満たす別アダプターへ差し替え可能にする。
+**非公式ライブラリは `Daiki-Iijima/insta360-go-ultra-sdk` に確定。** ライセンス条件・利用手順、GO Ultra 実機ファームウェアとの互換性、および展示 PC での動作は実装時に確認する。SDK の README にある動作確認は macOS／Raspberry Pi OS と特定ファームウェアであり、Windows での動作を確認できたわけではない。必要な対応はこの SDK のアダプター層で実施する。
 
 ### 3.2 接続フロー
 
@@ -490,7 +490,7 @@ Raspberry Pi／reCamera／RTSP 入力、複数カメラ、複数モデル同時�
 
 ### Phase 3: Insta360 GO Ultra ライブ入力
 
-1. 指定の非公式ライブラリを確定し、実機と展示 PC の対応状況を検証。
+1. 確定済みの `Daiki-Iijima/insta360-go-ultra-sdk` を使い、実機と展示 PC の対応状況を検証。
 2. GO Ultra の Wi-Fi 接続・独自 TCP ストリーム受信。
 3. FFmpeg による H.265 デコードと SourceService への接続。
 4. ライブ映像への YOLO／アラート／SQLite フレーム保存を統合。
@@ -518,7 +518,7 @@ Raspberry Pi／reCamera／RTSP 入力、複数カメラ、複数モデル同時�
 
 ## 15. 実装前に確認する項目
 
-1. **非公式ライブラリの指定:** 本書は `Daiki-Iijima/insta360-go-ultra-sdk` を採用候補として記載した。別ライブラリを想定している場合は GitHub URL を指定して差し替える。
+1. **非公式ライブラリ:** `Daiki-Iijima/insta360-go-ultra-sdk` で確定（実機での互換性・動作確認は未完了）。
 2. **実機動作:** Insta360 GO Ultra のファームウェア、展示 PC の OS（特に Windows）、Wi-Fi 接続、FFmpeg デコード可否。実機試験で確定する。
 3. **CPU 性能:** モデルファイルの容量、PC の CPU、H.265 デコード＋推論の FPS／遅延。
 4. **保存容量:** JPEG 画像の発報頻度と画質に応じて SQLite の容量を計測する。
