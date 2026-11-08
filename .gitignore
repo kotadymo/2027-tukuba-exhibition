@@ -208,6 +208,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Runtime data (uploaded models, videos, and SQLite database)
+/data/
+
 # PyPI configuration file
 .pypirc
 
