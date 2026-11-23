@@ -1,13 +1,13 @@
 # 動体展示用 AI 物体検出・アラートシステム 仕様書
 
-- **仕様バージョン:** 0.6.0
+- **仕様バージョン:** 0.7.0
 - **更新日:** 2026-11-23
 - **対象リポジトリ:** [kotadymo/2027-tukuba-exhibition](https://github.com/kotadymo/2027-tukuba-exhibition)
 - **状態:** 実装用仕様（Insta360 GO Ultra の接続部分は実機検証が必要）
 
 ## 1. 目的と確定事項
 
-展示用 Web アプリケーションとして、**Insta360 GO Ultra のライブ映像**または**アップロードした動画ファイル**を FastAPI で受信・処理し、CPU 上のカスタム YOLO 物体検出モデルで検出する。
+展示用 Web アプリケーションとして、**Insta360 GO Ultra のライブ映像**または**アップロードした動画ファイル**を FastAPI で受信・処理し、NVIDIA GPU（CUDA）またはCPU上のカスタムYOLO物体検出モデルで検出する。
 
 React の画面に映像と Bounding Box を表示し、設定された複数の物体クラスが同一フレーム内に存在したとき警告を表示・発音する。**アラートが発報した元フレーム画像と、そのフレームの検出情報を SQLite に記録**し、履歴から再表示できるようにする。保存されたフレームを危険物体の周囲で切り出し、**危険箇所のタップと危険理由2択による教材を自動生成**する。回答履歴は保存しない。
 
@@ -23,12 +23,12 @@ React の画面に映像と Bounding Box を表示し、設定された複数の
 | 動画ファイル入力 | Frontend からアップロードする MP4（H.264 推奨） |
 | 入力ソース | `insta360` と `video` の **2 種類を排他的に切り替え** |
 | モデル | Ultralytics 互換の物体検出用カスタム `.pt`、Frontend から登録／切り替え |
-| 推論 | 展示 PC の **CPU のみ**、1 モデル・1 映像ソース |
-| ルール | 同一推論フレーム内に選択した全クラスが存在する（AND） |
+| 推論 | **NVIDIA GPU（CUDA）／CPU**。Auto（CUDA優先・CPUフォールバック）、CUDA固定、CPU固定を画面で選択 |
+| ルール | 同一推論フレーム内に選択した全クラスが存在する（AND）、危険理由マスターを参照 |
 | 警告 | React 画面上の警告＋ブラウザでの PC 警告音 |
 | アラート保存 | **SQLite の JPEG BLOB＋検出データ＋発報メタデータ** |
-| 教材化 | 危険な物体周辺を切り出した静止画、異なる発報イベントから最大3問を生成 |
-| 問題 | 指定した検出ボックスをタップ → 危険な理由2択 → 正解と解説表示 |
+| 教材化 | 危険な物体周辺の切り出し静止画、異なる発報イベントから最大3問。**異なる危険理由を優先** |
+| 問題 | 正解ボックスをタップ → 危険理由マスターの**正解文／誤答文**で2択 → 解説 |
 | 教材の記録 | 元フレームと検出情報・教材メタデータは保持、学習者の回答・得点は保存しない |
 | 入力操作 | マウス・タッチパネル両対応 |
 | 通信 | REST API（設定・履歴）／WebSocket（映像＋検出＋イベント） |
@@ -59,11 +59,13 @@ React の画面に映像と Bounding Box を表示し、設定された複数の
                          │ 最新フレーム
                          ▼
                 InferenceService
-               カスタム YOLO / CPU
+               カスタム YOLO / CUDA または CPU
                          │ 同一フレームの検出結果
                          ▼
                     RuleEngine
                 AND / 継続 / 解除
+                 [HazardReasonMaster]
+                 正解・誤答・解説
                          │ アラート発報イベント
                          ▼
                    AlertService
@@ -247,196 +249,154 @@ Frontend に以下を表示する。
 - 新規追加フォームを開いたときは既存ルール一覧を隠さない。
 - 「登録ルール総数」はフィルター後の表示件数ではなく全件数を表示する。
 
-## 7. アラートフレーム・検出情報の SQLite 保存（新規要件）
+## 7. アラートフレーム・検出情報の SQLite 保存
 
-### 7.1 保存対象・タイミング
+### 7.1 保存対象
 
-**保存対象はアラートが新たに発報したフレームのみ**。全映像フレームや毎回の推論結果は保存しない。
+発報時に同一フレームの元JPEG BLOB（Bounding Boxを焼き込まない）、検出された全クラス・Confidence・BBox、モデル・入力・ルール・発報日時を1つのDBトランザクションで保存する。
 
-アラート判定が `pending → active` になった**当該推論フレーム**について、1 回の保存トランザクション内で以下を記録する。
+**教材付きルールでは、理由マスターID、正解理由、誤答理由、解説、正解ターゲットの検出IDと切り出し範囲をイベントごとにスナップショット保存する。** マスターやルールの後日変更が過去の教材に影響しないようにする。
 
-- フレーム画像（Bounding Box 等を描画する前の**元画像**を JPEG 圧縮し、SQLite BLOB に格納）。
-- 画像幅・高さ、フレーム ID、取得／発報日時、入力モード、使用モデル。
-- **そのフレームで YOLO が検出したすべての物体**のクラス ID・クラス名・Confidence・Bounding Box。ルールに関係しない物体も含める。
-- 発報したルール ID・ルール名スナップショット・発報日時。
-- 教材用の正解検出 ID・正しい危険理由・解説・画像切り出し座標のスナップショット（設定済みルールのみ）。
-- アップロード動画の場合は `video_id` と `media_time_ms`（再生位置）。
-- ライブの場合は入力元が GO Ultra であること。
+同じ画像フレームで複数ルールが発報した場合、`alert_frames`には**元画像を1枚だけ保存**し、複数`alert_events`から同じフレームを参照する。動画では`video_id`と`media_time_ms`も保持する。
 
-**同一フレームで複数ルールが発報した場合、フレーム画像と検出物体は 1 セットだけ保存**し、複数の `alert_events` から同じ `alert_frames.id` を参照する。入力セッション ID とフレーム ID を組み合わせて重複を避ける。
+### 7.2 書き込み・参照
 
-初期画質は **JPEG Quality 80**。画質は後から変更可能とする。画像 BLOB、検出レコード、アラートイベントを同一 DB トランザクションで確定し、一部だけが保存されないようにする。
+- `source_session_id + frame_id`を一意化。BLOB・検出・イベントは1トランザクション。
+- SQLiteのWALモードを使用し、保存処理が推論を長くブロックする場合は専用ワーカーに切り出す。
+- 保存エラーでも検出と映像表示は継続。警告をUIに表示し、保存に成功した場合のみ履歴IDを確定扱いにする。
+- 履歴画面で元画像とその時点の全BBoxを再描画。JPEGダウンロード可能。
+- 教材用の切り出し画像は要求時に生成し、追加のJPEG BLOBは保存しない。
+- 学習者の回答・正誤・点数・進捗は保存しない。
+- 自動削除は行わず、確認ダイアログ後に全履歴を削除可能。
 
-### 7.2 履歴画面
-
-- 新しい順に日時、ルール名、入力種別、モデル名を表示する。
-- イベント詳細画面で**保存した元 JPEG を読み出し、保存した検出ボックス・クラス名・Confidence を描画**する。
-- 発報対象のクラス／ルールに該当するボックスを区別して強調する。
-- 複数ルールが同じフレームで発報した場合は、各イベントから共通フレームを参照する。
-- 履歴画像はライブ配信とは別の REST API で取得できる。
-- 保存後に YOLO モデルやルールが変更・削除されても、記録時の検出情報と発報ルール名を表示できる。
-- アラート発報画像をダウンロードできるようにする（元 JPEG）。
-
-### 7.3 保存容量・削除
-
-- 動画全体や常時録画は保存しないため、イベント数に応じて SQLite 容量が増える。
-- 初期版は**自動削除を行わない**。履歴画面に「履歴を全件削除」操作を設ける（確認操作後にイベント・検出・フレームをまとめて削除）。
-- 削除時は他イベントから参照されている共通フレームを誤って削除しない。
-- 保存失敗時も映像表示・推論は継続し、画面とログに保存エラーを表示する。
-
-## 8. Frontend 画面仕様
-
-1920×1080 の展示 PC 用モニターを基準とする。全画面表示に対応する。
+## 8. Frontend 画面仕様（v0.7.0改訂）
 
 ### 8.1 ダッシュボード
 
-- **入力ソース切替:** 「Insta360 GO Ultra（ライブ）」／「アップロード動画」。
-- **ライブ操作:** 接続／切断、接続状態。
-- **動画操作:** MP4 アップロード、動画一覧・選択・削除、再生／一時停止／停止／先頭から再生、ループ ON/OFF、再生位置。
-- **映像表示:** 推論対象フレームの JPEG、Bounding Box、クラス名、Confidence、ルール成立対象の強調。
-- **ルール:** 一覧、追加、編集、削除、有効／無効、モデル不一致。
-- **警告:** 発報中ルールの大きな表示、警告音 ON/OFF、有効化、テスト警告。
-- **状態:** 接続状態、使用モデル、実測推論 FPS／処理時間。
-- **履歴:** 直近のイベント表示、履歴一覧・詳細への移動。
-- **教材:** 問題画面で最大3問、正解ボックスのクリック／タップ、理由2択、解説、完了画面。
+- Insta360ライブ／MP4動画の入力切り替え、再生・一時停止・停止・ループ。
+- 同じ推論フレームの画像とBounding Boxを表示。クラス名・Confidence・アラート対象の強調。
+- **要求推論モード／実効デバイス／CUDA利用可否／GPU名／CPUフォールバック理由／FPS**を表示。
+- 検出アラートの警告・ブラウザ警告音、履歴への導線。
+- **テストアラートは約4秒後に自動消去**（手動で閉じることも可能）。SQLiteへは記録しない。
 
-初期版では React の Canvas を使い、画像とボックスを同じ画像座標系で描画する。画面サイズを変更しても縦横比を保ち、ボックス座標を適切にスケールする。
+### 8.2 危険理由マスター管理（追加）
 
-### 8.2 モデル管理
+- 一覧、新規登録、編集、有効／無効化、未参照マスターの削除。
+- **名称・正解理由・誤答理由・解説文**を1セットとして入力し、2択プレビューを表示。
+- マスターの参照ルール数を表示する。正解理由と誤答理由が同文なら保存できない。
+- 「グローブ＋チャック」「グローブ＋ハンドル」などのルールが**同一理由ID**を選択できる。
 
-- カスタム `.pt` アップロード、検証結果表示。
-- モデル一覧、クラス一覧、アクティブモデル切り替え、未使用モデル削除。
+### 8.3 ルール管理（編集フォーム重複表示の修正）
 
-### 8.3 設定
+- 編集フォームを開いたルールは**下部のルール一覧から一時非表示**にする。他ルールは表示。
+- 保存成功・キャンセルで該当ルールを一覧に戻す。保存失敗時は入力内容を維持する。
+- 別ルールの編集へ移る場合は未保存変更の破棄を確認する。
+- 新規追加フォームでは既存ルール一覧を変更しない。総ルール数は表示行ではなくDBの全件数とする。
+- 教材設定欄では正解タップクラスと危険理由マスターを選択。直接理由・解説を書き込む旧UIは廃止。
 
-- GO Ultra 接続先 IP／ポート（初期値は SDK の記載値を参考）。
-- Confidence、IoU、`imgsz`、推論 FPS。
-- Bounding Box／クラス名／Confidence 表示 ON/OFF。
-- 警告音 ON/OFF。
-- JPEG 保存品質（初期値 80）。
+### 8.4 その他画面
 
-### 8.4 アラート履歴
+- モデル管理：`.pt`アップロード、選択、切り替え。
+- 推論・表示設定：`Auto / CUDA / CPU`、Confidence、IoU、`imgsz`、目標FPS、音声ON/OFF、表示オプション。
+- アラート履歴：保存画像・全検出ボックス・教材スナップショット閲覧、全履歴削除。
+- 問題画面：最大3問、正解ボックスタップ、理由2択、解説、完了画面。マウスとタッチに対応。
+- 未選択モデル・CUDA使用不能・動画なし・教材なし・Wi-Fi切断などを、実際の状態に合わせて表示する。
 
-- イベント一覧、イベント詳細、画像と検出ボックスの再描画。
-- JPEG ダウンロード。
-- 確認付きの履歴全件削除。
+### 8.5 フレーム描画競合の修正（レビュー④）
 
-## 9. REST API と WebSocket
+- 現行の非同期`Image.onload`が前後逆に完了すると旧フレームを上書きし得るため、**表示シーケンスIDまたはフレームIDで最新フレームのみ描画可能**にする。
+- デコード完了後・描画直前に現行フレームと一致するか確認し、旧処理を破棄する。
+- ソース切替・停止・WebSocket切断・モデル／デバイス変更時に保留中の描画を無効化。Object URL等も安全なタイミングで解放する。
+- リサイズでも現在のフレームに対応する画像とBBoxだけを描く。
 
-### 9.1 REST API
+### 8.6 M3の表示改善（レビュー⑥）
 
-すべての REST パスは `/api` を使用する。
+- MUI＋Material Design 3のトークンを継続使用。
+- 現行CSSの**9〜10pxの文字、29〜31pxのボタン**を点検・改善する。本文14〜16px、補助文字12〜14px以上、タップ領域約48 CSS px以上を目安とする。
+- 警告は色だけに依存せず文章とアイコンを併記し、文字・角丸・余白・状態色を共通トークンに統一する。
 
-| Method | Endpoint | 機能 |
+## 9. REST API と WebSocket（v0.7.0追加）
+
+既存のAPI（`/api/health`、`/api/source`、`/api/insta360`と`connect/disconnect`、`/api/videos`、`/api/videos/playback`、`/api/models`、`/api/models/active`、`/api/classes`、`/api/rules`、`/api/alerts`、`/api/alerts/test`、`/api/settings`、`/api/quiz/generate`、`/api/quiz/questions/{alert_event_id}/image`）は維持する。既存ID単位のGET/PUT/DELETE・activate・画像取得ルートも従来どおり。
+
+### 9.1 追加・変更API
+
+| Method | Endpoint | 概要 |
 | --- | --- | --- |
-| GET | `/api/health` | Backend 状態 |
-| GET | `/api/source` | 入力ソース種別・状態 |
-| PATCH | `/api/source` | `insta360` / `video` 切り替え |
-| GET | `/api/insta360` | GO Ultra 接続設定・状態 |
-| PATCH | `/api/insta360` | IP・ポート等の接続設定 |
-| POST | `/api/insta360/connect` | GO Ultra 接続・プレビュー開始 |
-| POST | `/api/insta360/disconnect` | 明示的切断 |
-| GET | `/api/videos` | 登録済み動画一覧 |
-| POST | `/api/videos` | MP4 アップロード（multipart） |
-| GET | `/api/videos/{id}` | 動画メタデータ |
-| POST | `/api/videos/{id}/activate` | 動画入力へ切り替え／選択 |
-| DELETE | `/api/videos/{id}` | 未使用動画の削除 |
-| GET | `/api/videos/playback` | 動画再生状態・位置 |
-| POST | `/api/videos/playback` | 再生操作 `play` / `pause` / `restart` / `stop` |
-| PATCH | `/api/videos/playback` | ループ設定 |
-| GET | `/api/models` | モデル一覧 |
-| POST | `/api/models` | `.pt` アップロード（multipart） |
-| GET | `/api/models/{id}` | モデル詳細・クラス |
-| POST | `/api/models/{id}/activate` | 使用モデル切り替え |
-| DELETE | `/api/models/{id}` | 未使用モデル削除 |
-| GET | `/api/models/active` | 有効モデル |
-| GET | `/api/classes` | 有効モデルのクラス一覧 |
-| GET | `/api/rules` | ルール一覧 |
-| POST | `/api/rules` | ルール登録 |
-| PUT | `/api/rules/{id}` | ルール編集 |
-| DELETE | `/api/rules/{id}` | ルール削除 |
-| GET | `/api/alerts` | アラート履歴（新しい順、limit/offset） |
-| GET | `/api/alerts/{id}` | イベント詳細＋保存済み検出情報＋画像の参照先 |
-| GET | `/api/alerts/{id}/frame` | 当該イベントの元 JPEG（image/jpeg） |
-| DELETE | `/api/alerts` | 全イベント／未参照フレーム・検出情報の削除 |
-| POST | `/api/alerts/test` | テスト警告（保存せず、区別して通知） |
-| POST | `/api/quiz/generate` | 保存済み発報イベントから最大3問を生成（DBへの学習セッション保存なし） |
-| GET | `/api/quiz/questions/{alert_event_id}/image` | 切り出し教材用JPEGの取得 |
-| GET | `/api/settings` | 共通設定取得 |
-| PATCH | `/api/settings` | 共通設定変更 |
+| **GET** | **`/api/devices`** | `cuda_available`、`cuda_device_count`、`gpu_name`、`requested_device`、`effective_device`、`fallback_reason`、`model_ready` |
+| GET | `/api/settings` | `requested_device`を返す。表示設定等も従来どおり |
+| PATCH | `/api/settings` | `requested_device`（`auto/cuda/cpu`）を設定可能にする。切替時はモデルの移行・検証を行う |
+| **GET** | **`/api/hazard-reasons`** | **危険理由一覧、参照ルール数** |
+| **POST** | **`/api/hazard-reasons`** | **正解文・誤答文・解説を含むマスター登録** |
+| **GET** | **`/api/hazard-reasons/{id}`** | **詳細** |
+| **PUT** | **`/api/hazard-reasons/{id}`** | **マスター編集・無効化** |
+| **DELETE** | **`/api/hazard-reasons/{id}`** | **参照ルールが0件のみ削除** |
+| POST/PUT | `/api/rules`・`/api/rules/{id}` | `hazard_reason_id`と`education_target_class_name`で教材設定 |
+| POST | `/api/quiz/generate` | 同一マスターに属する別ルールからも最大3問（`16`） |
 
-REST は JSON を返し、画像取得のみ `image/jpeg` とする。存在しない ID は `404`、使用中リソース削除は `409`、入力不正は `422`。モデル・動画のファイルを送る API は `multipart/form-data` とする。
+**モデル切り替え、デバイス切り替えの成功／失敗をAPIレスポンスで区別する。** CUDA固定でGPUが使えないときは409等で理由を返し、黙ってCPUへ切り替えない。AutoのCPUフォールバックは成功レスポンスだが理由を返す。
 
-### 9.2 WebSocket: `/ws/live`
+#### 登録例
 
-**バイナリのフレームメッセージ**は、`uint32_le(header_length)` + `UTF-8 JSON header` + `JPEG bytes` とする。
-
-ヘッダーには以下を含める。
-
-- `type="frame"`、`frame_id`、`source_session_id`、`timestamp`、`source_type`。
-- `width`、`height`、`detections`（クラス ID／名、Confidence、ピクセル座標 bbox）。
-- `matched_rule_ids`（現フレームで条件が成立しているルール）。
-- 動画入力時のみ `video_id`、`media_time_ms`。
-
-**テキスト JSON イベント:** `alert_started` / `alert_cleared` / `insta360_status` / `video_status` / `source_changed` / `model_changed` / `alert_save_error` / `error`。
-
-`alert_started` は `alert_id`、`rule_id`、`frame_id`、`source_session_id`、`timestamp` を持つ。履歴画像の取得は REST とし、**WebSocket 上で画像を再送保存する方式にはしない**。WebSocket 切断時は自動再接続し、REST で状態と最新履歴を再取得する。
-
-### 9.3 フレームメッセージの例（ヘッダーのみ）
+危険理由マスター:
 
 ~~~json
-{
-  "type": "frame",
-  "frame_id": 1234,
-  "source_session_id": "session-20261108-01",
-  "timestamp": "2026-11-08T16:21:00+09:00",
-  "source_type": "insta360",
-  "width": 640,
-  "height": 360,
-  "detections": [
-    {
-      "class_id": 0,
-      "class_name": "hand",
-      "confidence": 0.94,
-      "bbox": [42, 51, 178, 224]
-    }
-  ],
-  "matched_rule_ids": [1]
-}
+{"name":"手袋の巻き込み危険","correct_reason":"手袋が回転部に巻き込まれるおそれがあるため","wrong_reason":"工具の温度が低くなるため","explanation":"回転部への巻き込みに注意します。","enabled":true}
 ~~~
 
-## 10. SQLite スキーマ
+マスターを共有するルール:
 
-SQLite のファイルは `data/app.db` とする。モデル・アップロード動画はファイルシステムに保存し、**アラート発報画像は SQLite 本体に保存**する。
+~~~json
+{"name":"手袋と卓上ボール盤のチャック","class_names":["glove","bench_drill_chuck"],"enabled":true,"detection_duration_ms":500,"release_duration_ms":2000,"cooldown_ms":10000,"education_target_class_name":"glove","hazard_reason_id":1}
+~~~
 
-| テーブル | 主なカラム | 用途 |
-| --- | --- | --- |
-| `models` | `id, name, original_filename, stored_filename, file_size, created_at` | モデル管理 |
-| `model_classes` | `id, model_id, class_id, class_name` | モデルのクラス |
-| `model_settings` | `id, active_model_id, confidence, iou_threshold, imgsz, target_fps` | 推論設定 |
-| `source_settings` | `id, source_type, active_video_id, loop_enabled` | 入力ソース選択 |
-| `insta360_settings` | `id, camera_ip, tcp_port, reconnect_interval_ms` | GO Ultra 接続設定 |
-| `videos` | `id, name, original_filename, stored_filename, file_size, width, height, fps, duration_ms, created_at` | アップロード動画 |
-| `alert_rules` | `id, name, enabled, detection_duration_ms, release_duration_ms, cooldown_ms, education_target_class_name, correct_reason, explanation, created_at, updated_at` | ルールと教材用設定 |
-| `alert_rule_classes` | `id, rule_id, class_name` | ルール対象クラス |
-| **`alert_frames`** | **`id, source_session_id, frame_id, model_id, source_type, video_id, media_time_ms, captured_at, width, height, image_jpeg BLOB`** | **発報フレームそのもの** |
-| **`alert_frame_detections`** | **`id, alert_frame_id, class_id, class_name, confidence, x1, y1, x2, y2`** | **発報フレーム内の全検出物体** |
-| `alert_events` | `id, alert_frame_id, rule_id, model_id, rule_name_snapshot, matched_class_names_json, event_type, quiz_target_detection_id, quiz_correct_reason_snapshot, quiz_explanation_snapshot, crop_x1, crop_y1, crop_x2, crop_y2, created_at` | 発報イベント・教材スナップショット |
-| `app_settings` | `key, value_json` | 音声・画像保存品質等 |
+デバイス設定:
 
-### 10.1 保存・参照に関する規則
+~~~json
+{"requested_device":"auto"}
+~~~
 
-- `alert_frames` に **(source_session_id, frame_id)** の一意制約を設け、同一フレームの重複 BLOB 保存を防止する。
-- `alert_frame_detections.alert_frame_id` は `alert_frames.id` を参照する。
-- `alert_events.alert_frame_id` は `alert_frames.id` を参照する（テスト警告はイベント保存対象外）。
-- 同一フレームで複数ルールが発報した場合は 1 件の `alert_frames` と複数 `alert_events` を作る。
-- クラス名・座標・Confidence・ルール名は**発報時のスナップショット値**を残す。
-- モデル／動画が削除されてもアラート履歴は保持できるよう、参照 ID が欠損しても履歴表示が壊れない設計とする。
-- 教材スナップショットは**アラートイベント単位**に持たせ、同じフレームの別ルールから異なる正解対象を指定可能とする。
-- 回答・タップ履歴・得点・進捗を保存するテーブルは作成しない。
-- `image_jpeg` は元フレームの JPEG バイト列そのものとする。元の動画全体は DB に保存しない。
-- 書き込みを 1 トランザクションで処理し、SQLite は WAL モードを推奨する。
-- 履歴削除では関連イベント、フレーム、検出をまとめて削除する。
+### 9.2 WebSocket `/ws/live`
+
+バイナリフレーム形式`uint32_le(header_length) + UTF-8 JSON header + JPEG bytes`を維持し、フレームヘッダーに`effective_device`を追加する。フレームID・ソースセッションID・日時・画像サイズ・全検出結果・推論時間・FPS・動画位置を維持する。
+
+テキストイベントは従来の`alert_started`、`alert_cleared`、`insta360_status`、`video_status`、`source_changed`、`model_changed`、`alert_save_error`、`error`に加え、**`device_changed`・`device_fallback`**を通知。切替後は旧世代フレームを送信・表示しない。WebSocket切断後にRESTで最新状態を再取得する。
+
+## 10. SQLiteスキーマ（v0.7.0改訂）
+
+| テーブル | 主なカラム |
+| --- | --- |
+| `models` | `id, name, original_filename, stored_filename, file_size, created_at` |
+| `model_classes` | `id, model_id, class_id, class_name` |
+| `model_settings` | `id, active_model_id, requested_device, confidence, iou_threshold, imgsz, target_fps` |
+| `source_settings` | `id, source_type, active_video_id, loop_enabled` |
+| `insta360_settings` | `id, camera_ip, tcp_port, reconnect_interval_ms` |
+| `videos` | `id, name, original_filename, stored_filename, file_size, width, height, fps, duration_ms, created_at` |
+| **`hazard_reasons`** | **`id, name, correct_reason, wrong_reason, explanation, enabled, created_at, updated_at`** |
+| `alert_rules` | `id, name, enabled, detection_duration_ms, release_duration_ms, cooldown_ms, education_target_class_name, hazard_reason_id, created_at, updated_at` |
+| `alert_rule_classes` | `id, rule_id, class_name` |
+| `alert_frames` | `id, source_session_id, frame_id, model_id, model_name_snapshot, source_type, video_id, media_time_ms, captured_at, width, height, image_jpeg BLOB` |
+| `alert_frame_detections` | `id, alert_frame_id, class_id, class_name, confidence, x1, y1, x2, y2` |
+| `alert_events` | `id, alert_frame_id, rule_id, model_id, hazard_reason_id, rule_name_snapshot, matched_class_names_json, event_type, quiz_target_detection_id, quiz_correct_reason_snapshot, quiz_wrong_reason_snapshot, quiz_explanation_snapshot, crop_x1, crop_y1, crop_x2, crop_y2, created_at` |
+| `app_settings` | `key, value_json` |
+
+### 10.1 データ制約
+
+- `alert_rules.hazard_reason_id`は`hazard_reasons.id`への外部キー（教材未設定ならNULL）。理由マスターが参照中の間は削除禁止。
+- 危険理由マスターの正解文・誤答文の正規化比較を実施し、一致を拒否する。
+- 発報時にマスターID・**正解／誤答／解説のすべて**をイベントへスナップショット保存し、後からマスターを編集しても既存教材が変わらないようにする。
+- 同一`(source_session_id,frame_id)`は元画像1件。複数イベントから参照可。検出・フレーム・イベントは1トランザクション保存。
+- `requested_device`のみDBで永続化。`effective_device`は起動環境によって変わるため保存しない。
+- 学習者回答・得点・進捗・タップ位置は保存しない。
+
+### 10.2 DB初期化方針
+
+**デモ用途のため旧v0.6.0 SQLiteを初期化して新スキーマを作成してよい。旧ルールの危険理由文を自動移行する必要はない。**
+
+- **起動のたびにDBを消すことは禁止。** 既存DBが古い場合は初期化の必要性を画面／ログで明示し、READMEの手順に従い担当者が明示的に初期化する。
+- `data/app.db`を消すとアラートJPEG、検出情報、履歴、ルール、モデル／動画の登録メタデータを失う。必要なら削除前にDBを別名で保存する。
+- `data/models/`・`data/videos/`の実ファイルは自動削除しない。ただしDB初期化後はファイルを再登録しなければ一覧に戻らない。
+- 新スキーマは初回起動時に生成する。旧新スキーマを混在させず、初期化方法をREADMEに明記する。
 
 ## 11. 非機能要件
 
