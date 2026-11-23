@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import cv2
 import numpy as np
@@ -19,7 +19,7 @@ from app.database import (
     ModelRecord,
     ModelSettings,
 )
-from app.education import generate_quiz_questions, render_quiz_image
+from app.education import _select_candidates, generate_quiz_questions, render_quiz_image
 from app.main import _get_db, app
 
 
@@ -277,7 +277,7 @@ class EducationTests(unittest.TestCase):
             self.assertEqual(response["available_question_count"], 0)
             self.assertEqual(response["unavailable_reason"], "危険フレームがまだありません")
 
-    def test_same_reason_can_fill_three_questions_from_distinct_events(self):
+    def test_same_reason_from_ten_events_and_rules_generates_one_question(self):
         with Session(self.engine) as db:
             reason = HazardReason(
                 id=1,
@@ -286,26 +286,148 @@ class EducationTests(unittest.TestCase):
                 wrong_reason="工具の色が明るいため",
                 explanation="工具の可動部に巻き込まれる危険があります。",
             )
-            rule = AlertRule(id=1, name="hand + tool", hazard_reason=reason)
-            db.add_all([reason, rule])
+            rules = [
+                AlertRule(id=1, name="hand + tool", hazard_reason=reason),
+                AlertRule(id=2, name="hand + machine", hazard_reason=reason),
+            ]
+            db.add_all([reason, *rules])
             db.flush()
-            for frame_id in (1, 2, 3):
+            for frame_id in range(1, 11):
                 frame, target = self._frame(db, frame_id)
+                rule = rules[frame_id % len(rules)]
                 db.add(self._event(frame, target, rule, frame_id))
             db.commit()
 
             response = generate_quiz_questions(db, 3)
-            self.assertEqual(response["available_question_count"], 3)
+            self.assertEqual(response["available_question_count"], 1)
             event_ids = [question["alert_event_id"] for question in response["questions"]]
-            self.assertEqual(len(set(event_ids)), 3)
+            self.assertEqual(len(set(event_ids)), 1)
             frame_ids = {
                 db.get(AlertEvent, event_id).alert_frame_id for event_id in event_ids
             }
-            self.assertEqual(len(frame_ids), 3)
+            self.assertEqual(len(frame_ids), 1)
             self.assertEqual(
                 {question["hazard_reason_id"] for question in response["questions"]},
                 {reason.id},
             )
+            self.assertEqual(
+                {rule.hazard_reason_id for rule in rules},
+                {reason.id},
+            )
+
+    def test_candidate_selection_uses_distinct_reasons_and_caps_at_three(self):
+        for reason_count, expected_count in ((2, 2), (3, 3), (4, 3)):
+            with self.subTest(reason_count=reason_count):
+                candidates = []
+                event_id = 1
+                frame_id = 1
+                for reason_id in range(1, reason_count + 1):
+                    for rule_id in (reason_id * 10, reason_id * 10 + 1):
+                        candidates.append(
+                            self._selection_candidate(
+                                event_id=event_id,
+                                frame_id=frame_id,
+                                hazard_reason_id=reason_id,
+                                rule_id=rule_id,
+                            )
+                        )
+                        event_id += 1
+                        frame_id += 1
+
+                selected = _select_candidates(candidates, 3)
+                self.assertEqual(len(selected), expected_count)
+                self.assertEqual(
+                    len({candidate["hazard_reason_id"] for candidate in selected}),
+                    expected_count,
+                )
+                self.assertEqual(
+                    len({candidate["frame_id"] for candidate in selected}),
+                    expected_count,
+                )
+                self.assertEqual(
+                    len({candidate["event_id"] for candidate in selected}),
+                    expected_count,
+                )
+
+    def test_candidate_selection_uses_alternate_frames_for_distinct_reasons(self):
+        candidates = [
+            self._selection_candidate(1, 1, 1, 1),
+            self._selection_candidate(2, 1, 2, 2),
+            self._selection_candidate(3, 2, 2, 3),
+            self._selection_candidate(4, 2, 3, 4),
+            self._selection_candidate(5, 3, 3, 5),
+        ]
+
+        selected = _select_candidates(candidates, 3)
+
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(
+            {candidate["hazard_reason_id"] for candidate in selected},
+            {1, 2, 3},
+        )
+        self.assertEqual(
+            len({candidate["frame_id"] for candidate in selected}),
+            3,
+        )
+        self.assertEqual(
+            len({candidate["event_id"] for candidate in selected}),
+            3,
+        )
+
+    def test_candidate_selection_does_not_repeat_reasons_on_a_shared_frame(self):
+        candidates = [
+            self._selection_candidate(1, 1, 1, 1),
+            self._selection_candidate(2, 1, 2, 2),
+        ]
+
+        selected = _select_candidates(candidates, 3)
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(len({candidate["frame_id"] for candidate in selected}), 1)
+
+    def test_invalid_target_geometry_is_not_a_quiz_candidate(self):
+        with Session(self.engine) as db:
+            reason = HazardReason(
+                id=1,
+                name="invalid target",
+                correct_reason="手が工具に近いため",
+                wrong_reason="工具の色が明るいため",
+                explanation="工具の可動部に注意してください。",
+            )
+            rule = AlertRule(id=1, name="hand + tool", hazard_reason=reason)
+            db.add_all([reason, rule])
+            db.flush()
+            frame, target = self._frame(db, 1)
+            target.x2 = target.x1 + 1
+            db.add(self._event(frame, target, rule, 1))
+            db.commit()
+
+            response = generate_quiz_questions(db, 3)
+
+            self.assertEqual(response["questions"], [])
+            self.assertEqual(response["available_question_count"], 0)
+
+    def test_empty_saved_image_is_not_a_quiz_candidate(self):
+        with Session(self.engine) as db:
+            reason = HazardReason(
+                id=1,
+                name="missing image",
+                correct_reason="手が工具に近いため",
+                wrong_reason="工具の色が明るいため",
+                explanation="工具の可動部に注意してください。",
+            )
+            rule = AlertRule(id=1, name="hand + tool", hazard_reason=reason)
+            db.add_all([reason, rule])
+            db.flush()
+            frame, target = self._frame(db, 1)
+            frame.image_jpeg = b""
+            db.add(self._event(frame, target, rule, 1))
+            db.commit()
+
+            response = generate_quiz_questions(db, 3)
+
+            self.assertEqual(response["questions"], [])
+            self.assertEqual(response["available_question_count"], 0)
 
     def test_quiz_generation_does_not_select_jpeg_blobs(self):
         from sqlalchemy import event as sqlalchemy_event
@@ -346,7 +468,11 @@ class EducationTests(unittest.TestCase):
             ]
             self.assertTrue(quiz_selects)
             self.assertTrue(
-                all("image_jpeg" not in statement for statement in quiz_selects)
+                all(
+                    "image_jpeg"
+                    not in " ".join(statement.split()).split(" from ", 1)[0]
+                    for statement in quiz_selects
+                )
             )
 
     def _frame(self, db, frame_id):
@@ -385,6 +511,15 @@ class EducationTests(unittest.TestCase):
         return frame, frame.detections[0]
 
     @staticmethod
+    def _selection_candidate(event_id, frame_id, hazard_reason_id, rule_id):
+        return {
+            "event_id": event_id,
+            "frame_id": frame_id,
+            "hazard_reason_id": hazard_reason_id,
+            "rule_id": rule_id,
+        }
+
+    @staticmethod
     def _event(frame, target, rule, frame_id):
         return AlertEvent(
             alert_frame_id=frame.id,
@@ -403,15 +538,8 @@ class EducationTests(unittest.TestCase):
             crop_y1=10,
             crop_x2=110,
             crop_y2=90,
-            created_at=datetime(
-                2026,
-                11,
-                23,
-                0,
-                0,
-                4 - frame_id,
-                tzinfo=timezone.utc,
-            ),
+            created_at=datetime(2026, 11, 23, tzinfo=timezone.utc)
+            - timedelta(seconds=frame_id),
         )
 
 
