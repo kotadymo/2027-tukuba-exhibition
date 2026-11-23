@@ -1,3 +1,4 @@
+import random
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -348,6 +349,46 @@ class EducationTests(unittest.TestCase):
                     len({candidate["event_id"] for candidate in selected}),
                     expected_count,
                 )
+
+    def test_candidate_selection_randomizes_events_and_question_order(self):
+        candidates = [
+            self._selection_candidate(event_id, frame_id, reason_id, reason_id)
+            for reason_id in range(1, 4)
+            for event_id, frame_id in (
+                (reason_id * 10, reason_id * 10),
+                (reason_id * 10 + 1, reason_id * 10 + 1),
+            )
+        ]
+        selections = [
+            _select_candidates(candidates, 3, random.Random(seed))
+            for seed in range(20)
+        ]
+
+        for selected in selections:
+            self.assertEqual(len(selected), 3)
+            self.assertEqual(
+                len({candidate["hazard_reason_id"] for candidate in selected}),
+                3,
+            )
+            self.assertEqual(
+                len({candidate["frame_id"] for candidate in selected}),
+                3,
+            )
+            self.assertEqual(
+                len({candidate["event_id"] for candidate in selected}),
+                3,
+            )
+
+        event_sets = {
+            frozenset(candidate["event_id"] for candidate in selected)
+            for selected in selections
+        }
+        question_orders = {
+            tuple(candidate["event_id"] for candidate in selected)
+            for selected in selections
+        }
+        self.assertGreater(len(event_sets), 1)
+        self.assertGreater(len(question_orders), 1)
 
     def test_candidate_selection_uses_alternate_frames_for_distinct_reasons(self):
         candidates = [

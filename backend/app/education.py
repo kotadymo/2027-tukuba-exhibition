@@ -163,8 +163,14 @@ def _candidate_from_row(row) -> dict[str, object] | None:
 def _select_candidates(
     candidates: list[dict[str, object]],
     max_questions: int,
+    rng: random.Random | None = None,
 ) -> list[dict[str, object]]:
-    return _select_distinct_candidates(candidates, max_questions)
+    rng = rng or random.SystemRandom()
+    shuffled_candidates = list(candidates)
+    rng.shuffle(shuffled_candidates)
+    selected = _select_distinct_candidates(shuffled_candidates, max_questions)
+    rng.shuffle(selected)
+    return selected
 
 
 def _select_distinct_candidates(
@@ -209,13 +215,6 @@ def _select_distinct_candidates(
     return list(selected_by_reason.values())
 
 
-def _distinct_reason_count(
-    candidates: list[dict[str, object]],
-    max_questions: int,
-) -> int:
-    return len(_select_distinct_candidates(candidates, max_questions))
-
-
 def generate_quiz_questions(db: Session, max_questions: int = 3) -> dict:
     candidates: list[dict[str, object]] = []
     offset = 0
@@ -233,14 +232,11 @@ def generate_quiz_questions(db: Session, max_questions: int = 3) -> dict:
             if (candidate := _candidate_from_row(row)) is not None
         )
         offset += len(rows)
-        if (
-            _distinct_reason_count(candidates, max_questions) >= max_questions
-            or len(rows) < QUIZ_METADATA_PAGE_SIZE
-        ):
+        if len(rows) < QUIZ_METADATA_PAGE_SIZE:
             break
 
-    selected = _select_candidates(candidates, max_questions)
     rng = random.SystemRandom()
+    selected = _select_candidates(candidates, max_questions, rng)
     questions = []
     for candidate in selected:
         geometry = candidate["geometry"]
