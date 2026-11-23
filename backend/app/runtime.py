@@ -13,7 +13,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 
@@ -30,7 +30,14 @@ from .database import (
     Video,
 )
 from .alert_storage import persist_alert_frame_events
-from .inference import Detection, Detector
+from .inference import (
+    CUDADeviceError,
+    CUDAUnavailableError,
+    Detection,
+    Detector,
+    ModelValidationError,
+    get_cuda_status,
+)
 from .insta360_source import Insta360Source, Insta360SourceError
 
 
@@ -164,7 +171,9 @@ class RuleEngine:
                                 "education_target_class_name": rule.get(
                                     "education_target_class_name"
                                 ),
+                                "hazard_reason_id": rule.get("hazard_reason_id"),
                                 "correct_reason": rule.get("correct_reason"),
+                                "wrong_reason": rule.get("wrong_reason"),
                                 "explanation": rule.get("explanation"),
                                 "test": False,
                             }
@@ -849,12 +858,21 @@ class CaptureController:
 
 
 class InferenceWorker:
-    def __init__(self, rule_engine: RuleEngine, hub: WebSocketHub):
+    def __init__(
+        self,
+        rule_engine: RuleEngine,
+        hub: WebSocketHub,
+        on_cuda_error: Callable[[CUDADeviceError, int], None] | None = None,
+    ):
         self._rule_engine = rule_engine
         self._hub = hub
+        self._on_cuda_error = on_cuda_error
         self._frames: queue.Queue[tuple[FrameInput, int]] = queue.Queue(maxsize=1)
         self._lock = threading.RLock()
         self._stop = threading.Event()
+        self._inference_idle = threading.Event()
+        self._inference_idle.set()
+        self._paused = False
         self._pipeline_generation = 0
         self._detector: Detector | None = None
         self._model_id: int | None = None
@@ -870,8 +888,9 @@ class InferenceWorker:
         self._last_result_at: float | None = None
         self._stream_stale = False
         self._last_inference_error: str | None = None
+        self._last_processing_ms: float | None = None
         self._inference_times: deque[float] = deque(maxlen=30)
-        self._thread = threading.Thread(target=self._run, name="cpu-inference", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="inference-worker", daemon=True)
 
     def start(self) -> None:
         self._thread.start()
@@ -882,6 +901,8 @@ class InferenceWorker:
 
     def offer(self, frame: FrameInput) -> None:
         with self._lock:
+            if self._paused:
+                return
             item = (frame, self._pipeline_generation)
             try:
                 self._frames.put_nowait(item)
@@ -900,12 +921,32 @@ class InferenceWorker:
             self._pipeline_generation += 1
             self._last_result_at = None
             self._stream_stale = False
+            self._last_processing_ms = None
             self._inference_times.clear()
             try:
                 while True:
                     self._frames.get_nowait()
             except queue.Empty:
                 return
+
+    def pause(self) -> None:
+        with self._lock:
+            self._paused = True
+        self.clear_frames()
+        if not self._inference_idle.wait(timeout=30):
+            with self._lock:
+                self._paused = False
+            raise RuntimeError("推論処理が停止せず、デバイス切り替えを中断しました")
+
+    def pause_after_current(self) -> None:
+        with self._lock:
+            self._paused = True
+        self.clear_frames()
+
+    def resume(self) -> None:
+        self.clear_frames()
+        with self._lock:
+            self._paused = False
 
     def set_model(self, detector: Detector | None, model_id: int | None, name: str | None) -> None:
         with self._lock:
@@ -930,12 +971,17 @@ class InferenceWorker:
                 "model_id": model_id,
                 "model_name": name,
                 "model_generation": generation,
+                "effective_device": detector.device if detector is not None else "none",
             }
         )
 
     def set_settings(self, settings: dict[str, Any]) -> None:
         with self._lock:
             self._settings.update(settings)
+
+    def current_model_generation(self) -> int:
+        with self._lock:
+            return self._model_generation
 
     def _run(self) -> None:
         next_inference_at = 0.0
@@ -944,6 +990,10 @@ class InferenceWorker:
                 detector = self._detector
                 settings = dict(self._settings)
                 generation = self._model_generation
+                paused = self._paused
+            if paused:
+                self._stop.wait(0.1)
+                continue
             if detector is None:
                 self._check_stale()
                 self._stop.wait(0.2)
@@ -962,10 +1012,12 @@ class InferenceWorker:
 
             with self._lock:
                 if (
-                    frame_generation != self._pipeline_generation
+                    self._paused
+                    or frame_generation != self._pipeline_generation
                     or generation != self._model_generation
                 ):
                     continue
+                self._inference_idle.clear()
             started_at = time.monotonic()
             try:
                 detections = detector.predict(
@@ -984,6 +1036,7 @@ class InferenceWorker:
                         continue
                     self._last_result_at = finished_at
                     self._stream_stale = False
+                    self._last_processing_ms = processing_ms
                     self._inference_times.append(finished_at)
                     current_model_id = self._model_id
                     current_model_name = self._model_name
@@ -1032,6 +1085,7 @@ class InferenceWorker:
                     "processing_ms": round(processing_ms, 2),
                     "inference_fps": round(fps, 2),
                     "model_name": current_model_name,
+                    "effective_device": detector.device,
                 }
                 header_bytes = json.dumps(
                     header, ensure_ascii=False, separators=(",", ":")
@@ -1109,15 +1163,26 @@ class InferenceWorker:
                             "message": f"推論に失敗しました: {message}",
                         }
                     )
+                if isinstance(exc, CUDADeviceError) and self._on_cuda_error is not None:
+                    self._on_cuda_error(exc, generation)
                 next_inference_at = time.monotonic() + 1 / max(
                     0.1, settings["target_fps"]
                 )
+            finally:
+                self._inference_idle.set()
 
     def _current_fps(self) -> float:
         if len(self._inference_times) < 2:
             return 0.0
         elapsed = self._inference_times[-1] - self._inference_times[0]
         return (len(self._inference_times) - 1) / elapsed if elapsed > 0 else 0.0
+
+    def metrics(self) -> dict[str, float | None]:
+        with self._lock:
+            return {
+                "inference_fps": self._current_fps(),
+                "processing_ms": self._last_processing_ms,
+            }
 
     def _check_stale(self) -> None:
         with self._lock:
@@ -1145,18 +1210,35 @@ class LiveRuntime:
     def __init__(self, hub: WebSocketHub):
         self.hub = hub
         self.rules = RuleEngine()
-        self.inference = InferenceWorker(self.rules, hub)
+        self.inference = InferenceWorker(self.rules, hub, self._schedule_cuda_failure)
         self.capture = CaptureController(
             on_frame=self.inference.offer,
             on_event=self.hub.publish_event,
             on_reset=self._reset_pipeline,
         )
+        self._device_lock = threading.RLock()
+        self._transition_lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._transition_pending = False
+        self._cuda_status = {
+            "cuda_available": False,
+            "cuda_device_count": 0,
+            "gpu_name": None,
+            "cuda_error": None,
+        }
+        self.requested_device = "auto"
+        self.effective_device = "none"
+        self.fallback_reason: str | None = None
+        self.device_error: str | None = None
         self.active_model_id: int | None = None
         self.active_model_name: str | None = None
+        self._model_path: Path | None = None
         self.model_error: str | None = None
         self.model_loaded = False
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._cuda_status = await asyncio.to_thread(get_cuda_status)
         with SessionLocal() as db:
             model_settings = db.get(ModelSettings, 1)
             source_settings = db.get(SourceSettings, 1)
@@ -1166,10 +1248,14 @@ class LiveRuntime:
 
             rule_records = list(
                 db.scalars(
-                    select(AlertRule).options(selectinload(AlertRule.classes))
+                    select(AlertRule).options(
+                        selectinload(AlertRule.classes),
+                        selectinload(AlertRule.hazard_reason),
+                    )
                 ).all()
             )
             if model_settings is not None:
+                self.requested_device = model_settings.requested_device or "auto"
                 jpeg_quality_setting = db.get(AppSetting, "jpeg_quality")
                 self.inference.set_settings(
                     {
@@ -1192,6 +1278,7 @@ class LiveRuntime:
                         model_path = Path(active_model.stored_filename)
                         if not model_path.is_absolute():
                             model_path = MODELS_DIR / model_path
+                        self._model_path = model_path
                     else:
                         model_path = None
                 else:
@@ -1212,8 +1299,22 @@ class LiveRuntime:
                         "release_duration_ms": rule.release_duration_ms,
                         "cooldown_ms": rule.cooldown_ms,
                         "education_target_class_name": rule.education_target_class_name,
-                        "correct_reason": rule.correct_reason,
-                        "explanation": rule.explanation,
+                        "hazard_reason_id": rule.hazard_reason_id,
+                        "correct_reason": (
+                            rule.hazard_reason.correct_reason
+                            if rule.hazard_reason is not None
+                            else None
+                        ),
+                        "wrong_reason": (
+                            rule.hazard_reason.wrong_reason
+                            if rule.hazard_reason is not None
+                            else None
+                        ),
+                        "explanation": (
+                            rule.hazard_reason.explanation
+                            if rule.hazard_reason is not None
+                            else None
+                        ),
                     }
                     for rule in rule_records
                 ]
@@ -1252,12 +1353,23 @@ class LiveRuntime:
 
         if active_model is not None and model_path is not None:
             try:
-                detector = await asyncio.to_thread(Detector.load, model_path)
-                self.inference.set_model(detector, active_model.id, active_model.name)
-                self.model_loaded = True
+                detector, effective_device, fallback_reason = await asyncio.to_thread(
+                    self._load_detector,
+                    model_path,
+                    self.requested_device,
+                )
+                self._install_detector(
+                    detector,
+                    active_model.id,
+                    active_model.name,
+                    model_path,
+                    effective_device,
+                    fallback_reason,
+                )
             except Exception as exc:
                 self.model_error = f"有効モデルを読み込めません: {exc}"
-                self.model_loaded = False
+                self.device_error = str(exc)
+                self.effective_device = "none"
                 logger.exception("Could not restore the active model")
                 self.inference.set_model(None, active_model.id, active_model.name)
                 self.hub.publish_event(
@@ -1267,8 +1379,283 @@ class LiveRuntime:
                         "message": self.model_error,
                     }
                 )
+        elif (
+            self.requested_device == "cuda"
+            and not self._cuda_status["cuda_available"]
+        ):
+            self.device_error = self._cuda_unavailable_message()
+        elif self.requested_device == "auto" and not self._cuda_status["cuda_available"]:
+            self.fallback_reason = self._cuda_unavailable_message()
         self.capture.start()
         self.inference.start()
+
+    def _cuda_unavailable_message(self) -> str:
+        return self._cuda_status.get("cuda_error") or (
+            "CUDA 対応 NVIDIA GPU を利用できないため CPU を使用しています"
+        )
+
+    def _load_detector(
+        self,
+        model_path: Path,
+        requested_device: str,
+    ) -> tuple[Detector, str, str | None]:
+        if requested_device == "cuda":
+            if not self._cuda_status["cuda_available"]:
+                raise CUDAUnavailableError(self._cuda_unavailable_message())
+            return Detector.load(model_path, "cuda:0"), "cuda:0", None
+        if requested_device == "cpu":
+            return Detector.load(model_path, "cpu"), "cpu", None
+        if requested_device != "auto":
+            raise ValueError(f"未対応の推論デバイスです: {requested_device}")
+
+        if self._cuda_status["cuda_available"]:
+            try:
+                return Detector.load(model_path, "cuda:0"), "cuda:0", None
+            except Exception as exc:
+                reason = f"CUDA の初期化に失敗したため CPU に切り替えました: {exc}"
+                logger.warning(reason)
+                return Detector.load(model_path, "cpu"), "cpu", reason
+
+        return (
+            Detector.load(model_path, "cpu"),
+            "cpu",
+            self._cuda_unavailable_message(),
+        )
+
+    def get_device_status(self) -> dict[str, Any]:
+        with self._device_lock:
+            return {
+                **self._cuda_status,
+                "requested_device": self.requested_device,
+                "effective_device": self.effective_device,
+                "fallback_reason": self.fallback_reason,
+                "device_error": self.device_error,
+                "model_error": self.model_error,
+                "model_ready": self.model_loaded,
+                **self.inference.metrics(),
+            }
+
+    def _publish_device_changed(self) -> None:
+        self.hub.publish_event(
+            {"type": "device_changed", **self.get_device_status()}
+        )
+
+    def _install_detector(
+        self,
+        detector: Detector,
+        model_id: int,
+        name: str,
+        model_path: Path,
+        effective_device: str,
+        fallback_reason: str | None,
+    ) -> None:
+        with self._device_lock:
+            self.active_model_id = model_id
+            self.active_model_name = name
+            self._model_path = model_path
+            self.effective_device = effective_device
+            self.fallback_reason = fallback_reason
+            self.device_error = None
+            self.model_error = None
+            self.model_loaded = True
+        self.inference.set_model(detector, model_id, name)
+        self._publish_device_changed()
+        if fallback_reason:
+            self.hub.publish_event(
+                {
+                    "type": "device_fallback",
+                    "requested_device": self.requested_device,
+                    "effective_device": effective_device,
+                    "fallback_reason": fallback_reason,
+                }
+            )
+
+    async def activate_model(
+        self,
+        model_path: Path,
+        model_id: int,
+        name: str,
+        persist: Callable[[], None],
+    ) -> dict[str, Any]:
+        async with self._transition_lock:
+            await asyncio.to_thread(self.inference.pause)
+            try:
+                detector, effective_device, fallback_reason = await asyncio.to_thread(
+                    self._load_detector,
+                    model_path,
+                    self.requested_device,
+                )
+                persist()
+                self._install_detector(
+                    detector,
+                    model_id,
+                    name,
+                    model_path,
+                    effective_device,
+                    fallback_reason,
+                )
+                return self.get_device_status()
+            except Exception as exc:
+                with self._device_lock:
+                    self.device_error = str(exc)
+                raise
+            finally:
+                await asyncio.to_thread(self.inference.resume)
+
+    async def switch_device(
+        self,
+        requested_device: str,
+        persist: Callable[[], None],
+    ) -> dict[str, Any]:
+        async with self._transition_lock:
+            await asyncio.to_thread(self.inference.pause)
+            try:
+                if self._model_path is not None:
+                    detector, effective_device, fallback_reason = await asyncio.to_thread(
+                        self._load_detector,
+                        self._model_path,
+                        requested_device,
+                    )
+                else:
+                    if (
+                        requested_device == "cuda"
+                        and not self._cuda_status["cuda_available"]
+                    ):
+                        raise CUDAUnavailableError(self._cuda_unavailable_message())
+                    detector = None
+                    effective_device = "none"
+                    fallback_reason = (
+                        self._cuda_unavailable_message()
+                        if requested_device == "auto"
+                        and not self._cuda_status["cuda_available"]
+                        else None
+                    )
+
+                persist()
+                with self._device_lock:
+                    self.requested_device = requested_device
+                    self.device_error = None
+                if detector is not None:
+                    self._install_detector(
+                        detector,
+                        self.active_model_id,
+                        self.active_model_name or "",
+                        self._model_path,
+                        effective_device,
+                        fallback_reason,
+                    )
+                else:
+                    with self._device_lock:
+                        self.effective_device = "none"
+                        self.fallback_reason = fallback_reason
+                        self.model_loaded = False
+                        self.model_error = None
+                    self._reset_pipeline(True, "device_changed")
+                    self._publish_device_changed()
+                    if fallback_reason:
+                        self.hub.publish_event(
+                            {
+                                "type": "device_fallback",
+                                "requested_device": requested_device,
+                                "effective_device": "none",
+                                "fallback_reason": fallback_reason,
+                            }
+                        )
+                return self.get_device_status()
+            except Exception as exc:
+                with self._device_lock:
+                    self.device_error = str(exc)
+                raise
+            finally:
+                await asyncio.to_thread(self.inference.resume)
+
+    def _schedule_cuda_failure(
+        self,
+        error: CUDADeviceError,
+        model_generation: int,
+    ) -> None:
+        with self._device_lock:
+            if (
+                self._transition_pending
+                or self.effective_device != "cuda:0"
+                or model_generation != self.inference.current_model_generation()
+            ):
+                return
+            self._transition_pending = True
+            loop = self._loop
+        self.inference.pause_after_current()
+        if loop is None or loop.is_closed():
+            with self._device_lock:
+                self._transition_pending = False
+            logger.error("Cannot schedule CUDA recovery because the runtime event loop is closed")
+            return
+        loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(
+                self._handle_cuda_failure(str(error), model_generation)
+            )
+        )
+
+    async def _handle_cuda_failure(
+        self,
+        error_message: str,
+        model_generation: int,
+    ) -> None:
+        try:
+            async with self._transition_lock:
+                if (
+                    self.effective_device != "cuda:0"
+                    or model_generation != self.inference.current_model_generation()
+                ):
+                    return
+                await asyncio.to_thread(self.inference.pause)
+                try:
+                    if self.requested_device == "auto" and self._model_path is not None:
+                        reason = f"CUDA 推論に失敗したため CPU に切り替えました: {error_message}"
+                        try:
+                            detector = await asyncio.to_thread(
+                                Detector.load,
+                                self._model_path,
+                                "cpu",
+                            )
+                        except Exception as exc:
+                            self._disable_after_cuda_error(
+                                f"{reason} CPU への切り替えにも失敗しました: {exc}",
+                                "cuda_fallback_failed",
+                            )
+                        else:
+                            self._install_detector(
+                                detector,
+                                self.active_model_id,
+                                self.active_model_name or "",
+                                self._model_path,
+                                "cpu",
+                                reason,
+                            )
+                    else:
+                        self._disable_after_cuda_error(
+                            f"CUDA 推論に失敗しました。CPU へは自動切り替えません: {error_message}",
+                            "cuda_inference_failed",
+                        )
+                finally:
+                    await asyncio.to_thread(self.inference.resume)
+        finally:
+            with self._device_lock:
+                self._transition_pending = False
+
+    def _disable_after_cuda_error(self, message: str, code: str) -> None:
+        with self._device_lock:
+            model_id = self.active_model_id
+            model_name = self.active_model_name
+            self.model_loaded = False
+            self.effective_device = "none"
+            self.model_error = message
+            self.device_error = message
+            self.fallback_reason = None
+        self.inference.set_model(None, model_id, model_name)
+        self._publish_device_changed()
+        self.hub.publish_event(
+            {"type": "error", "code": code, "message": message}
+        )
 
     def stop(self) -> None:
         self.capture.stop()
@@ -1285,11 +1672,14 @@ class LiveRuntime:
         self.hub.publish_event({"type": "rules_changed"})
 
     def set_model(self, detector: Detector, model_id: int, name: str) -> None:
-        self.model_error = None
-        self.model_loaded = True
-        self.active_model_id = model_id
-        self.active_model_name = name
-        self.inference.set_model(detector, model_id, name)
+        self._install_detector(
+            detector,
+            model_id,
+            name,
+            self._model_path or Path(),
+            detector.device,
+            None,
+        )
 
     def set_inference_settings(self, settings: dict[str, Any]) -> None:
         self.inference.set_settings(settings)

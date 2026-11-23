@@ -28,7 +28,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, exists, select
+from sqlalchemy import delete, exists, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from .database import (
@@ -38,6 +38,7 @@ from .database import (
     AlertRule,
     AlertRuleClass,
     AppSetting,
+    HazardReason,
     Insta360Settings,
     MAX_MODEL_SIZE_BYTES,
     MAX_VIDEO_SIZE_BYTES,
@@ -52,7 +53,7 @@ from .database import (
     initialize_database,
 )
 from .education import generate_quiz_questions, render_quiz_image
-from .inference import Detector, ModelValidationError
+from .inference import CUDAUnavailableError, Detector, ModelValidationError
 from .runtime import LiveRuntime, WebSocketHub
 from .schemas import (
     Insta360SettingsPatch,
@@ -62,6 +63,8 @@ from .schemas import (
     RulePayload,
     SettingsPatch,
     SourcePatch,
+    HazardReasonPayload,
+    normalize_reason_text,
 )
 
 
@@ -85,7 +88,12 @@ def _get_db():
 
 def _rule_configuration(db: Session) -> list[dict[str, Any]]:
     records = db.scalars(
-        select(AlertRule).options(selectinload(AlertRule.classes)).order_by(AlertRule.id)
+        select(AlertRule)
+        .options(
+            selectinload(AlertRule.classes),
+            selectinload(AlertRule.hazard_reason),
+        )
+        .order_by(AlertRule.id)
     ).all()
     return [
         {
@@ -97,8 +105,22 @@ def _rule_configuration(db: Session) -> list[dict[str, Any]]:
             "release_duration_ms": rule.release_duration_ms,
             "cooldown_ms": rule.cooldown_ms,
             "education_target_class_name": rule.education_target_class_name,
-            "correct_reason": rule.correct_reason,
-            "explanation": rule.explanation,
+            "hazard_reason_id": rule.hazard_reason_id,
+            "correct_reason": (
+                rule.hazard_reason.correct_reason
+                if rule.hazard_reason is not None
+                else None
+            ),
+            "wrong_reason": (
+                rule.hazard_reason.wrong_reason
+                if rule.hazard_reason is not None
+                else None
+            ),
+            "explanation": (
+                rule.hazard_reason.explanation
+                if rule.hazard_reason is not None
+                else None
+            ),
         }
         for rule in records
     ]
@@ -153,14 +175,70 @@ def _serialize_rule(rule: AlertRule, statuses: dict[int, dict[str, Any]]) -> dic
         "release_duration_ms": rule.release_duration_ms,
         "cooldown_ms": rule.cooldown_ms,
         "education_target_class_name": rule.education_target_class_name,
-        "correct_reason": rule.correct_reason,
-        "explanation": rule.explanation,
+        "hazard_reason_id": rule.hazard_reason_id,
+        "hazard_reason_name": (
+            rule.hazard_reason.name if rule.hazard_reason is not None else None
+        ),
         "state": status["state"],
         "incompatible": status["incompatible"],
         "missing_class_names": status["missing_class_names"],
         "created_at": _isoformat_utc(rule.created_at),
         "updated_at": _isoformat_utc(rule.updated_at),
     }
+
+
+def _serialize_hazard_reason(reason: HazardReason) -> dict[str, Any]:
+    return {
+        "id": reason.id,
+        "name": reason.name,
+        "correct_reason": reason.correct_reason,
+        "wrong_reason": reason.wrong_reason,
+        "explanation": reason.explanation,
+        "enabled": reason.enabled,
+        "reference_rule_count": len(reason.rules),
+        "created_at": _isoformat_utc(reason.created_at),
+        "updated_at": _isoformat_utc(reason.updated_at),
+    }
+
+
+def _validate_unique_correct_reason(
+    db: Session,
+    correct_reason: str,
+    exclude_id: int | None = None,
+) -> None:
+    statement = select(HazardReason.id, HazardReason.correct_reason)
+    if exclude_id is not None:
+        statement = statement.where(HazardReason.id != exclude_id)
+    records = db.execute(statement).all()
+    normalized = normalize_reason_text(correct_reason)
+    if any(normalize_reason_text(existing) == normalized for _, existing in records):
+        raise HTTPException(
+            status_code=409,
+            detail="同じ正解理由を持つ危険理由マスターがすでに登録されています",
+        )
+
+
+def _validate_rule_hazard_reason(
+    db: Session,
+    payload: RulePayload,
+    existing_rule: AlertRule | None = None,
+) -> None:
+    if payload.hazard_reason_id is None:
+        return
+    reason = _get_or_404(
+        db,
+        HazardReason,
+        payload.hazard_reason_id,
+        "危険理由マスター",
+    )
+    if (
+        not reason.enabled
+        and (existing_rule is None or existing_rule.hazard_reason_id != reason.id)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="無効な危険理由マスターは新しいルールに設定できません",
+        )
 
 
 def _get_or_404(db: Session, model_type, item_id: int, label: str):
@@ -296,7 +374,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="動体展示用 AI 物体検出・アラートシステム",
-    version="0.6.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
 
@@ -761,22 +839,29 @@ async def activate_model(model_id: int, request: Request, db: Session = Depends(
     if model is None:
         raise HTTPException(status_code=404, detail="モデルが見つかりません")
     model_path = MODELS_DIR / model.stored_filename
+    runtime: LiveRuntime = request.app.state.runtime
+    def persist_active_model() -> None:
+        settings = db.get(ModelSettings, 1)
+        if settings is None:
+            settings = ModelSettings(id=1)
+            db.add(settings)
+        settings.active_model_id = model.id
+        db.commit()
+
     try:
-        detector = await run_in_threadpool(Detector.load, model_path)
+        await runtime.activate_model(
+            model_path,
+            model.id,
+            model.name,
+            persist_active_model,
+        )
+    except CUDAUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ModelValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
-        logger.exception("Could not load model")
+        logger.exception("Could not activate model")
         raise HTTPException(status_code=422, detail=f"モデルを読み込めません: {exc}") from exc
-
-    settings = db.get(ModelSettings, 1)
-    if settings is None:
-        settings = ModelSettings(id=1)
-        db.add(settings)
-    settings.active_model_id = model.id
-    db.commit()
-    runtime: LiveRuntime = request.app.state.runtime
-    runtime.set_model(detector, model.id, model.name)
     return _serialize_model(model, model.id, model.id)
 
 
@@ -818,7 +903,12 @@ def list_rules(request: Request, db: Session = Depends(_get_db)):
     runtime: LiveRuntime = request.app.state.runtime
     statuses = runtime.rules.statuses()
     records = db.scalars(
-        select(AlertRule).options(selectinload(AlertRule.classes)).order_by(AlertRule.id)
+        select(AlertRule)
+        .options(
+            selectinload(AlertRule.classes),
+            selectinload(AlertRule.hazard_reason),
+        )
+        .order_by(AlertRule.id)
     ).all()
     return [_serialize_rule(rule, statuses) for rule in records]
 
@@ -841,9 +931,68 @@ def _validate_rule_classes(db: Session, class_names: list[str]) -> None:
         )
 
 
+@app.get("/api/hazard-reasons")
+def list_hazard_reasons(db: Session = Depends(_get_db)):
+    reasons = db.scalars(
+        select(HazardReason)
+        .options(selectinload(HazardReason.rules))
+        .order_by(HazardReason.name, HazardReason.id)
+    ).all()
+    return [_serialize_hazard_reason(reason) for reason in reasons]
+
+
+@app.post("/api/hazard-reasons", status_code=201)
+def create_hazard_reason(
+    payload: HazardReasonPayload,
+    db: Session = Depends(_get_db),
+):
+    _validate_unique_correct_reason(db, payload.correct_reason)
+    reason = HazardReason(**payload.model_dump())
+    db.add(reason)
+    db.commit()
+    db.refresh(reason)
+    return _serialize_hazard_reason(reason)
+
+
+@app.put("/api/hazard-reasons/{reason_id}")
+def update_hazard_reason(
+    reason_id: int,
+    payload: HazardReasonPayload,
+    request: Request,
+    db: Session = Depends(_get_db),
+):
+    reason = _get_or_404(db, HazardReason, reason_id, "危険理由マスター")
+    _validate_unique_correct_reason(db, payload.correct_reason, exclude_id=reason_id)
+    for key, value in payload.model_dump().items():
+        setattr(reason, key, value)
+    db.commit()
+    db.refresh(reason)
+    request.app.state.runtime.configure_rules(_rule_configuration(db))
+    return _serialize_hazard_reason(reason)
+
+
+@app.delete("/api/hazard-reasons/{reason_id}")
+def delete_hazard_reason(reason_id: int, db: Session = Depends(_get_db)):
+    reason = _get_or_404(db, HazardReason, reason_id, "危険理由マスター")
+    reference_count = db.scalar(
+        select(func.count(AlertRule.id)).where(
+            AlertRule.hazard_reason_id == reason_id
+        )
+    )
+    if reference_count:
+        raise HTTPException(
+            status_code=409,
+            detail="アラートルールで参照中の危険理由マスターは削除できません",
+        )
+    db.delete(reason)
+    db.commit()
+    return {"deleted": True, "id": reason.id}
+
+
 @app.post("/api/rules", status_code=201)
 def create_rule(payload: RulePayload, request: Request, db: Session = Depends(_get_db)):
     _validate_rule_classes(db, payload.class_names)
+    _validate_rule_hazard_reason(db, payload)
     rule = AlertRule(
         name=payload.name,
         enabled=payload.enabled,
@@ -851,8 +1000,7 @@ def create_rule(payload: RulePayload, request: Request, db: Session = Depends(_g
         release_duration_ms=payload.release_duration_ms,
         cooldown_ms=payload.cooldown_ms,
         education_target_class_name=payload.education_target_class_name,
-        correct_reason=payload.correct_reason,
-        explanation=payload.explanation,
+        hazard_reason_id=payload.hazard_reason_id,
         classes=[AlertRuleClass(class_name=name) for name in payload.class_names],
     )
     db.add(rule)
@@ -871,14 +1019,14 @@ def update_rule(
 ):
     _validate_rule_classes(db, payload.class_names)
     rule = _get_or_404(db, AlertRule, rule_id, "ルール")
+    _validate_rule_hazard_reason(db, payload, rule)
     rule.name = payload.name
     rule.enabled = payload.enabled
     rule.detection_duration_ms = payload.detection_duration_ms
     rule.release_duration_ms = payload.release_duration_ms
     rule.cooldown_ms = payload.cooldown_ms
     rule.education_target_class_name = payload.education_target_class_name
-    rule.correct_reason = payload.correct_reason
-    rule.explanation = payload.explanation
+    rule.hazard_reason_id = payload.hazard_reason_id
     existing_classes = {item.class_name: item for item in rule.classes}
     requested_classes = set(payload.class_names)
     for class_name, item in existing_classes.items():
@@ -999,7 +1147,9 @@ def get_alert(alert_id: int, db: Session = Depends(_get_db)):
         ),
         "education": {
             "target_detection_id": event.quiz_target_detection_id,
+            "hazard_reason_id": event.hazard_reason_id,
             "correct_reason": event.quiz_correct_reason_snapshot,
+            "wrong_reason": event.quiz_wrong_reason_snapshot,
             "explanation": event.quiz_explanation_snapshot,
             "crop_bbox": (
                 [
@@ -1072,25 +1222,43 @@ def get_quiz_image(alert_event_id: int, db: Session = Depends(_get_db)):
 
 
 @app.get("/api/settings")
-def get_settings(db: Session = Depends(_get_db)):
+def get_settings(request: Request, db: Session = Depends(_get_db)):
     settings = db.get(ModelSettings, 1)
+    runtime: LiveRuntime = request.app.state.runtime
+    device_status = runtime.get_device_status()
     values = _app_settings(db)
     return {
         "confidence": settings.confidence if settings else 0.4,
         "iou_threshold": settings.iou_threshold if settings else 0.7,
         "imgsz": settings.imgsz if settings else 416,
         "target_fps": settings.target_fps if settings else 5.0,
+        "requested_device": (
+            settings.requested_device
+            if settings
+            else device_status["requested_device"]
+        ),
+        **device_status,
         **values,
         "max_model_size_bytes": MAX_MODEL_SIZE_BYTES,
         "max_video_size_bytes": MAX_VIDEO_SIZE_BYTES,
     }
 
 
+@app.get("/api/devices")
+def get_devices(request: Request):
+    runtime: LiveRuntime = request.app.state.runtime
+    return runtime.get_device_status()
+
+
 @app.patch("/api/settings")
-def patch_settings(payload: SettingsPatch, request: Request, db: Session = Depends(_get_db)):
+async def patch_settings(
+    payload: SettingsPatch,
+    request: Request,
+    db: Session = Depends(_get_db),
+):
     values = payload.model_dump(exclude_unset=True)
     if not values:
-        return get_settings(db)
+        return get_settings(request, db)
     if any(value is None for value in values.values()):
         raise HTTPException(status_code=422, detail="設定値に null は指定できません")
     model_values = {
@@ -1102,6 +1270,10 @@ def patch_settings(payload: SettingsPatch, request: Request, db: Session = Depen
     if settings is None:
         settings = ModelSettings(id=1)
         db.add(settings)
+    requested_device = values.get("requested_device")
+    current_device = request.app.state.runtime.requested_device
+    if requested_device is not None:
+        settings.requested_device = requested_device
     for key, value in model_values.items():
         setattr(settings, key, value)
     app_setting_keys = (
@@ -1114,12 +1286,27 @@ def patch_settings(payload: SettingsPatch, request: Request, db: Session = Depen
     for key in app_setting_keys:
         if key in values:
             _set_app_setting(db, key, values[key])
-    db.commit()
+    runtime: LiveRuntime = request.app.state.runtime
+    if requested_device is not None and requested_device != current_device:
+        try:
+            await runtime.switch_device(requested_device, db.commit)
+        except CUDAUnavailableError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Could not switch inference device")
+            raise HTTPException(
+                status_code=422,
+                detail=f"推論デバイスを切り替えられません: {exc}",
+            ) from exc
+    else:
+        db.commit()
     inference_values = dict(model_values)
     if "jpeg_quality" in values:
         inference_values["jpeg_quality"] = values["jpeg_quality"]
-    request.app.state.runtime.set_inference_settings(inference_values)
-    return get_settings(db)
+    runtime.set_inference_settings(inference_values)
+    return get_settings(request, db)
 
 
 @app.websocket("/ws/live")

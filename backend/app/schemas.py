@@ -45,8 +45,7 @@ class RulePayload(BaseModel):
     release_duration_ms: int = Field(default=2000, ge=0, le=600_000)
     cooldown_ms: int = Field(default=10_000, ge=0, le=3_600_000)
     education_target_class_name: str | None = Field(default=None, max_length=255)
-    correct_reason: str | None = Field(default=None, max_length=2000)
-    explanation: str | None = Field(default=None, max_length=4000)
+    hazard_reason_id: int | None = Field(default=None, ge=1)
 
     @field_validator("name")
     @classmethod
@@ -68,11 +67,7 @@ class RulePayload(BaseModel):
             raise ValueError("ルールには異なるクラスを2種類以上選択してください")
         return normalized
 
-    @field_validator(
-        "education_target_class_name",
-        "correct_reason",
-        "explanation",
-    )
+    @field_validator("education_target_class_name")
     @classmethod
     def normalize_education_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -88,12 +83,51 @@ class RulePayload(BaseModel):
             raise ValueError("教材の正解対象クラスはルール対象クラスから選択してください")
         return self
 
+    @model_validator(mode="after")
+    def validate_education_configuration(self):
+        if (self.education_target_class_name is None) != (
+            self.hazard_reason_id is None
+        ):
+            raise ValueError(
+                "教材を設定する場合は正解対象クラスと危険理由マスターを両方指定してください"
+            )
+        return self
+
+
+class HazardReasonPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    correct_reason: str = Field(min_length=1, max_length=2000)
+    wrong_reason: str = Field(min_length=1, max_length=2000)
+    explanation: str = Field(min_length=1, max_length=4000)
+    enabled: bool = True
+
+    @field_validator("name", "correct_reason", "wrong_reason", "explanation")
+    @classmethod
+    def strip_required_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("空欄にはできません")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_reason_pair(self):
+        if normalize_reason_text(self.correct_reason) == normalize_reason_text(
+            self.wrong_reason
+        ):
+            raise ValueError("正解理由と誤答理由に同じ文章は登録できません")
+        return self
+
+
+def normalize_reason_text(value: str) -> str:
+    return " ".join(value.split())
+
 
 class QuizGeneratePayload(BaseModel):
     max_questions: int = Field(default=3, ge=1, le=3)
 
 
 class SettingsPatch(BaseModel):
+    requested_device: Literal["auto", "cuda", "cpu"] | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
     iou_threshold: float | None = Field(default=None, ge=0, le=1)
     imgsz: int | None = Field(default=None, ge=32, le=2048)

@@ -3,22 +3,28 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import sessionmaker
 
 from app.database import (
-    AlertEvent,
+    DatabaseSchemaError,
+    ModelSettings,
     SourceSettings,
     initialize_database,
 )
 
 
 class DatabaseMigrationTests(unittest.TestCase):
-    def test_legacy_camera_and_alert_history_are_migrated(self):
+    def test_legacy_schema_is_rejected_without_deleting_existing_data(self):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
+            models_dir = data_dir / "models"
+            videos_dir = data_dir / "videos"
+            models_dir.mkdir()
+            videos_dir.mkdir()
+            (models_dir / "keep.pt").write_bytes(b"model")
+            (videos_dir / "keep.mp4").write_bytes(b"video")
             engine = create_engine("sqlite://")
-            session_local = sessionmaker(bind=engine, expire_on_commit=False)
             try:
                 with engine.begin() as connection:
                     connection.exec_driver_sql(
@@ -53,6 +59,38 @@ class DatabaseMigrationTests(unittest.TestCase):
 
                 with (
                     patch("app.database.engine", engine),
+                    patch("app.database.DATA_DIR", data_dir),
+                    patch("app.database.MODELS_DIR", models_dir),
+                    patch("app.database.VIDEOS_DIR", videos_dir),
+                ):
+                    with self.assertRaisesRegex(DatabaseSchemaError, "明示的に"):
+                        initialize_database()
+
+                columns = {
+                    column["name"]
+                    for column in inspect(engine).get_columns("alert_events")
+                }
+                self.assertNotIn("alert_frame_id", columns)
+                self.assertNotIn("hazard_reason_id", columns)
+                self.assertNotIn("source_settings", inspect(engine).get_table_names())
+                with engine.connect() as connection:
+                    legacy_event = connection.exec_driver_sql(
+                        "SELECT rule_name_snapshot FROM alert_events WHERE id = 1"
+                    ).scalar_one()
+                self.assertEqual(legacy_event, "legacy rule")
+                self.assertEqual((models_dir / "keep.pt").read_bytes(), b"model")
+                self.assertEqual((videos_dir / "keep.mp4").read_bytes(), b"video")
+            finally:
+                engine.dispose()
+
+    def test_new_database_gets_v070_schema_and_auto_device_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            engine = create_engine("sqlite://")
+            session_local = sessionmaker(bind=engine, expire_on_commit=False)
+            try:
+                with (
+                    patch("app.database.engine", engine),
                     patch("app.database.SessionLocal", session_local),
                     patch("app.database.DATA_DIR", data_dir),
                     patch("app.database.MODELS_DIR", data_dir / "models"),
@@ -60,32 +98,10 @@ class DatabaseMigrationTests(unittest.TestCase):
                 ):
                     initialize_database()
 
-                columns = {
-                    column["name"]
-                    for column in inspect(engine).get_columns("alert_events")
-                }
-                self.assertIn("alert_frame_id", columns)
-                self.assertIn("matched_class_names_json", columns)
-                self.assertIn("quiz_target_detection_id", columns)
-                self.assertIn("quiz_correct_reason_snapshot", columns)
-                self.assertIn("crop_x1", columns)
-                rule_columns = {
-                    column["name"]
-                    for column in inspect(engine).get_columns("alert_rules")
-                }
-                self.assertIn("education_target_class_name", rule_columns)
-                self.assertIn("correct_reason", rule_columns)
-                self.assertIn("explanation", rule_columns)
+                self.assertIn("hazard_reasons", inspect(engine).get_table_names())
                 with session_local() as db:
-                    source = db.get(SourceSettings, 1)
-                    legacy_event = db.scalar(
-                        select(AlertEvent).where(AlertEvent.id == 1)
-                    )
-                    self.assertEqual(source.source_type, "video")
-                    self.assertEqual(source.active_video_id, 42)
-                    self.assertFalse(source.loop_enabled)
-                    self.assertEqual(legacy_event.rule_name_snapshot, "legacy rule")
-                    self.assertIsNone(legacy_event.alert_frame_id)
+                    self.assertEqual(db.get(ModelSettings, 1).requested_device, "auto")
+                    self.assertEqual(db.get(SourceSettings, 1).source_type, "insta360")
             finally:
                 engine.dispose()
 

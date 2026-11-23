@@ -145,6 +145,7 @@ def _frame(frame_id, media_time_ms):
 
 class _FakeDetector:
     names = {0: "hand", 1: "tool"}
+    device = "cpu"
 
     def predict(self, _frame, confidence, iou_threshold, imgsz):
         self.last_settings = (confidence, iou_threshold, imgsz)
