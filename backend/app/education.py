@@ -108,6 +108,7 @@ def _candidate_query():
             AlertFrameDetection.id == AlertEvent.quiz_target_detection_id,
         )
         .where(
+            func.length(AlertFrame.image_jpeg) > 0,
             AlertFrameDetection.alert_frame_id == AlertEvent.alert_frame_id,
             AlertEvent.hazard_reason_id.is_not(None),
             AlertEvent.quiz_target_detection_id.is_not(None),
@@ -163,36 +164,7 @@ def _select_candidates(
     candidates: list[dict[str, object]],
     max_questions: int,
 ) -> list[dict[str, object]]:
-    selected = _select_distinct_candidates(candidates, max_questions)
-    if len(selected) >= max_questions:
-        return selected
-    selected_frames = {candidate["frame_id"] for candidate in selected}
-
-    candidates_by_reason: dict[int, list[dict[str, object]]] = {}
-    for candidate in candidates:
-        candidates_by_reason.setdefault(candidate["hazard_reason_id"], []).append(
-            candidate
-        )
-
-    reason_groups = sorted(
-        candidates_by_reason.values(),
-        key=lambda group: len({candidate["frame_id"] for candidate in group}),
-    )
-    selected_rules = {candidate["rule_id"] for candidate in selected}
-    for prefer_new_rule in (True, False):
-        for group in reason_groups:
-            for candidate in group:
-                frame_id = candidate["frame_id"]
-                if frame_id in selected_frames:
-                    continue
-                if prefer_new_rule and candidate["rule_id"] in selected_rules:
-                    continue
-                selected.append(candidate)
-                selected_frames.add(frame_id)
-                selected_rules.add(candidate["rule_id"])
-                if len(selected) >= max_questions:
-                    return selected
-    return selected
+    return _select_distinct_candidates(candidates, max_questions)
 
 
 def _select_distinct_candidates(
