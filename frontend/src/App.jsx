@@ -1,12 +1,38 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  Button as MuiButton,
+  ButtonBase,
+  Checkbox as MuiCheckbox,
+  FormControlLabel,
+  IconButton as MuiIconButton,
+  MenuItem,
+  Switch as MuiSwitch,
+  TextField as MuiTextField,
+} from '@mui/material'
+import DashboardOutlined from '@mui/icons-material/DashboardOutlined'
+import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
+import EditOutlined from '@mui/icons-material/EditOutlined'
+import HistoryOutlined from '@mui/icons-material/HistoryOutlined'
+import Inventory2Outlined from '@mui/icons-material/Inventory2Outlined'
+import PauseRounded from '@mui/icons-material/PauseRounded'
+import PlayArrowRounded from '@mui/icons-material/PlayArrowRounded'
+import RefreshRounded from '@mui/icons-material/RefreshRounded'
+import ReplayRounded from '@mui/icons-material/ReplayRounded'
+import SchoolOutlined from '@mui/icons-material/SchoolOutlined'
+import SettingsOutlined from '@mui/icons-material/SettingsOutlined'
+import StopRounded from '@mui/icons-material/StopRounded'
+import VolumeUpOutlined from '@mui/icons-material/VolumeUpOutlined'
 import { apiRequest, apiResourceUrl, liveSocketUrl, uploadFile } from './services/api.js'
 import './App.css'
 
+const QuizPage = lazy(() => import('./components/QuizPage.jsx'))
+
 const navigation = [
-  { id: 'dashboard', label: 'ダッシュボード', icon: '◉' },
-  { id: 'models', label: 'モデル管理', icon: '▣' },
-  { id: 'settings', label: '設定', icon: '⚙' },
-  { id: 'alerts', label: 'アラート履歴', icon: '◷' },
+  { id: 'dashboard', label: 'ダッシュボード', icon: <DashboardOutlined /> },
+  { id: 'quiz', label: '問題に挑戦', icon: <SchoolOutlined /> },
+  { id: 'models', label: 'モデル管理', icon: <Inventory2Outlined /> },
+  { id: 'settings', label: '設定', icon: <SettingsOutlined /> },
+  { id: 'alerts', label: 'アラート履歴', icon: <HistoryOutlined /> },
 ]
 
 const statusNames = {
@@ -53,6 +79,42 @@ function statusClass(status) {
   return 'is-muted'
 }
 
+function AppButton({ children, className = '', color, variant, ...props }) {
+  const resolvedVariant = variant || (
+    className.includes('button-primary')
+      ? 'contained'
+      : className.includes('button-outline')
+        ? 'outlined'
+        : 'text'
+  )
+  const resolvedColor = color || (
+    className.includes('danger-text')
+      ? 'error'
+      : className.includes('button-primary')
+        ? 'primary'
+        : 'inherit'
+  )
+  return (
+    <MuiButton
+      className={className}
+      color={resolvedColor}
+      disableElevation
+      variant={resolvedVariant}
+      {...props}
+    >
+      {children}
+    </MuiButton>
+  )
+}
+
+function AppIconButton({ children, className = '', ...props }) {
+  return (
+    <MuiIconButton className={className} color="inherit" {...props}>
+      {children}
+    </MuiIconButton>
+  )
+}
+
 function CanvasView({ frame, settings, alerts, message }) {
   const containerRef = useRef(null)
   const canvasRef = useRef(null)
@@ -82,7 +144,7 @@ function CanvasView({ frame, settings, alerts, message }) {
       const context = canvas.getContext('2d')
       if (!context) return
       context.setTransform(ratio, 0, 0, ratio, 0, 0)
-      context.fillStyle = '#080d12'
+      context.fillStyle = '#141218'
       context.fillRect(0, 0, bounds.width, bounds.height)
       if (!frame) return
 
@@ -106,7 +168,7 @@ function CanvasView({ frame, settings, alerts, message }) {
           const boxHeight = Math.max(0, (y2 - y1) * scale)
           const highlighted = highlightedClasses.has(detection.class_name)
           const color = highlighted
-            ? '#ff4d67'
+            ? '#f2b8b5'
             : `hsl(${(detection.class_id * 71 + 152) % 360} 88% 64%)`
           if (settings?.show_boxes !== false) {
             context.strokeStyle = color
@@ -124,7 +186,7 @@ function CanvasView({ frame, settings, alerts, message }) {
             const labelTop = Math.max(0, top - labelHeight)
             context.fillStyle = color
             context.fillRect(left, labelTop, labelWidth, labelHeight)
-            context.fillStyle = '#071014'
+            context.fillStyle = '#381e72'
             context.fillText(label, left + 6, labelTop + 16)
           }
         }
@@ -162,11 +224,18 @@ function RuleEditor({ rule, classes, onSave, onCancel, saving }) {
   const [releaseDuration, setReleaseDuration] = useState(rule?.release_duration_ms ?? 2000)
   const [cooldown, setCooldown] = useState(rule?.cooldown_ms ?? 10000)
   const [enabled, setEnabled] = useState(rule?.enabled ?? true)
+  const [educationTarget, setEducationTarget] = useState(
+    rule?.education_target_class_name || '',
+  )
+  const [correctReason, setCorrectReason] = useState(rule?.correct_reason || '')
+  const [explanation, setExplanation] = useState(rule?.explanation || '')
 
   const toggleClass = (className) => {
-    setSelectedClasses((current) => current.includes(className)
-      ? current.filter((value) => value !== className)
-      : [...current, className])
+    const nextClasses = selectedClasses.includes(className)
+      ? selectedClasses.filter((value) => value !== className)
+      : [...selectedClasses, className]
+    setSelectedClasses(nextClasses)
+    if (!nextClasses.includes(educationTarget)) setEducationTarget('')
   }
 
   const submit = (event) => {
@@ -178,6 +247,9 @@ function RuleEditor({ rule, classes, onSave, onCancel, saving }) {
       detection_duration_ms: Number(detectionDuration),
       release_duration_ms: Number(releaseDuration),
       cooldown_ms: Number(cooldown),
+      education_target_class_name: educationTarget || null,
+      correct_reason: correctReason.trim() || null,
+      explanation: explanation.trim() || null,
     })
   }
 
@@ -188,83 +260,120 @@ function RuleEditor({ rule, classes, onSave, onCancel, saving }) {
           <span className="eyebrow">{rule ? 'RULE EDITOR' : 'NEW RULE'}</span>
           <h3>{rule ? 'ルールを編集' : 'アラートルールを追加'}</h3>
         </div>
-        <button className="icon-button" type="button" onClick={onCancel} aria-label="閉じる">×</button>
+        <AppIconButton className="icon-button" type="button" onClick={onCancel} aria-label="閉じる">×</AppIconButton>
       </div>
-      <label className="field">
-        <span>ルール名</span>
-        <input
-          maxLength="120"
-          onChange={(event) => setName(event.target.value)}
-          placeholder="例：手とドリル"
-          required
-          value={name}
-        />
-      </label>
+      <MuiTextField
+        fullWidth
+        label="ルール名"
+        onChange={(event) => setName(event.target.value)}
+        placeholder="例：手とドリル"
+        required
+        slotProps={{ htmlInput: { maxLength: 120 } }}
+        value={name}
+      />
       <fieldset className="class-picker">
         <legend>必要なクラス <small>2種類以上</small></legend>
         {classes.length ? (
           <div className="class-options">
             {classes.map((item) => (
-              <label className="check-option" key={item.class_id}>
-                <input
-                  checked={selectedClasses.includes(item.class_name)}
-                  onChange={() => toggleClass(item.class_name)}
-                  type="checkbox"
-                />
-                <span>{item.class_name}</span>
-              </label>
+              <FormControlLabel
+                className="check-option"
+                control={(
+                  <MuiCheckbox
+                    checked={selectedClasses.includes(item.class_name)}
+                    onChange={() => toggleClass(item.class_name)}
+                  />
+                )}
+                key={item.class_id}
+                label={item.class_name}
+              />
             ))}
           </div>
         ) : (
           <p className="subtle-text">モデルを有効化するとクラスを選択できます。</p>
         )}
       </fieldset>
-      <div className="duration-grid">
-        <label className="field">
-          <span>成立まで (ms)</span>
-          <input
-            max="600000"
-            min="0"
-            onChange={(event) => setDetectionDuration(event.target.value)}
-            type="number"
-            value={detectionDuration}
-          />
-        </label>
-        <label className="field">
-          <span>解除まで (ms)</span>
-          <input
-            max="600000"
-            min="0"
-            onChange={(event) => setReleaseDuration(event.target.value)}
-            type="number"
-            value={releaseDuration}
-          />
-        </label>
-        <label className="field">
-          <span>クールダウン (ms)</span>
-          <input
-            max="3600000"
-            min="0"
-            onChange={(event) => setCooldown(event.target.value)}
-            type="number"
-            value={cooldown}
-          />
-        </label>
+      <div className="education-rule-fields">
+        <div>
+          <span className="control-label">教材設定（任意）</span>
+          <p className="helper-text">
+            3項目を登録すると、発報時の画像から危険予知クイズを作成します。
+          </p>
+        </div>
+        <MuiTextField
+          disabled={selectedClasses.length === 0}
+          fullWidth
+          label="問題でタップさせる正解対象クラス"
+          onChange={(event) => setEducationTarget(event.target.value)}
+          select
+          value={selectedClasses.includes(educationTarget) ? educationTarget : ''}
+        >
+          <MenuItem value="">未設定</MenuItem>
+          {selectedClasses.map((className) => (
+            <MenuItem key={className} value={className}>{className}</MenuItem>
+          ))}
+        </MuiTextField>
+        <MuiTextField
+          fullWidth
+          label="危険な理由（2択の正解）"
+          maxRows={4}
+          minRows={2}
+          onChange={(event) => setCorrectReason(event.target.value)}
+          placeholder="例：手袋を着用したまま卓上ボール盤を使用しているため"
+          value={correctReason}
+          multiline
+        />
+        <MuiTextField
+          fullWidth
+          label="危険な理由の解説"
+          maxRows={5}
+          minRows={2}
+          onChange={(event) => setExplanation(event.target.value)}
+          placeholder="危険の内容と安全な行動を説明します"
+          value={explanation}
+          multiline
+        />
       </div>
-      <label className="toggle-row compact-toggle">
-        <span>このルールを有効にする</span>
-        <input checked={enabled} onChange={(event) => setEnabled(event.target.checked)} type="checkbox" />
-        <i />
-      </label>
+      <div className="duration-grid">
+        <MuiTextField
+          fullWidth
+          label="成立まで (ms)"
+          onChange={(event) => setDetectionDuration(event.target.value)}
+          slotProps={{ htmlInput: { max: 600000, min: 0 } }}
+          type="number"
+          value={detectionDuration}
+        />
+        <MuiTextField
+          fullWidth
+          label="解除まで (ms)"
+          onChange={(event) => setReleaseDuration(event.target.value)}
+          slotProps={{ htmlInput: { max: 600000, min: 0 } }}
+          type="number"
+          value={releaseDuration}
+        />
+        <MuiTextField
+          fullWidth
+          label="クールダウン (ms)"
+          onChange={(event) => setCooldown(event.target.value)}
+          slotProps={{ htmlInput: { max: 3600000, min: 0 } }}
+          type="number"
+          value={cooldown}
+        />
+      </div>
+      <FormControlLabel
+        className="rule-enabled-control"
+        control={<MuiSwitch checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />}
+        label="このルールを有効にする"
+      />
       <div className="form-actions">
-        <button className="button button-quiet" onClick={onCancel} type="button">キャンセル</button>
-        <button
+        <AppButton className="button button-quiet" onClick={onCancel} type="button">キャンセル</AppButton>
+        <AppButton
           className="button button-primary"
           disabled={saving || selectedClasses.length < 2}
           type="submit"
         >
           {saving ? '保存中…' : 'ルールを保存'}
-        </button>
+        </AppButton>
       </div>
     </form>
   )
@@ -717,6 +826,9 @@ function App() {
         detection_duration_ms: rule.detection_duration_ms,
         release_duration_ms: rule.release_duration_ms,
         cooldown_ms: rule.cooldown_ms,
+        education_target_class_name: rule.education_target_class_name || null,
+        correct_reason: rule.correct_reason || null,
+        explanation: rule.explanation || null,
       }),
     })
     await refreshData()
@@ -925,7 +1037,7 @@ function App() {
         <div className="side-section-label">WORKSPACE</div>
         <nav className="side-nav" aria-label="メインナビゲーション">
           {navigation.map((item) => (
-            <button
+            <ButtonBase
               className={`nav-item ${page === item.id ? 'is-active' : ''}`}
               key={item.id}
               onClick={() => setPage(item.id)}
@@ -934,7 +1046,7 @@ function App() {
               <span className="nav-icon">{item.icon}</span>
               <span>{item.label}</span>
               {item.id === 'alerts' && alertCount > 0 && <span className="nav-count">{alertCount}</span>}
-            </button>
+            </ButtonBase>
           ))}
         </nav>
         <div className="sidebar-bottom">
@@ -945,7 +1057,7 @@ function App() {
               <small>{socketStatus === 'connected' ? 'リアルタイム接続中' : '再接続を試行中'}</small>
             </div>
           </div>
-          <div className="sidebar-version">展示用システム <span>v0.5.1</span></div>
+          <div className="sidebar-version">展示用システム <span>v0.6.0</span></div>
         </div>
       </aside>
 
@@ -960,9 +1072,24 @@ function App() {
               <span className="status-dot" />
               {socketStatus === 'connected' ? 'システム稼働中' : '接続待ち'}
             </div>
-            <button className="icon-button refresh-button" onClick={() => refreshData().catch(() => {})} type="button" title="再読み込み">
-              ↻
-            </button>
+            {page !== 'quiz' && (
+              <AppButton
+                onClick={() => setPage('quiz')}
+                startIcon={<SchoolOutlined />}
+                variant="contained"
+              >
+                問題に挑戦
+              </AppButton>
+            )}
+            <AppIconButton
+              aria-label="再読み込み"
+              className="icon-button refresh-button"
+              onClick={() => refreshData().catch(() => {})}
+              title="再読み込み"
+              type="button"
+            >
+              <RefreshRounded />
+            </AppIconButton>
           </div>
         </header>
 
@@ -970,18 +1097,18 @@ function App() {
           <div className="notice notice-error" role="alert">
             <span>!</span>
             <p>{apiError}</p>
-            <button className="icon-button" onClick={() => setApiError('')} type="button" aria-label="閉じる">×</button>
+            <AppIconButton className="icon-button" onClick={() => setApiError('')} type="button" aria-label="閉じる">×</AppIconButton>
           </div>
         )}
         {alertSaveError && (
           <div className="notice notice-error" role="alert">
             <span>!</span>
             <p>{alertSaveError}</p>
-            <button className="icon-button" onClick={() => setAlertSaveError('')} type="button" aria-label="閉じる">×</button>
+            <AppIconButton className="icon-button" onClick={() => setAlertSaveError('')} type="button" aria-label="閉じる">×</AppIconButton>
           </div>
         )}
 
-        {activeAlerts.length > 0 && (
+        {page !== 'quiz' && activeAlerts.length > 0 && (
           <section className="alert-stack" aria-live="assertive">
             {activeAlerts.map((alert) => (
               <div className="alert-banner" key={alert.id}>
@@ -993,12 +1120,12 @@ function App() {
                     {alert.timestamp && ` · ${formatDate(alert.timestamp)}`}
                   </span>
                 </div>
-                <button
+                <AppIconButton
                   className="icon-button"
                   onClick={() => setActiveAlerts((current) => current.filter((item) => item.id !== alert.id))}
                   type="button"
                   aria-label="警告を閉じる"
-                >×</button>
+                >×</AppIconButton>
               </div>
             ))}
           </section>
@@ -1061,39 +1188,44 @@ function App() {
                   <div className="source-switch">
                     <span className="control-label">映像入力</span>
                     <div className="segmented-control">
-                      <button
+                      <ButtonBase
                         className={camera?.source_type === 'insta360' ? 'is-selected' : ''}
                         onClick={() => changeSource('insta360')}
                         type="button"
-                      >Insta360 GO Ultra（ライブ）</button>
-                      <button
+                      >Insta360 GO Ultra（ライブ）</ButtonBase>
+                      <ButtonBase
                         className={camera?.source_type === 'video' ? 'is-selected' : ''}
                         onClick={() => changeSource('video')}
                         type="button"
-                      >アップロード動画</button>
+                      >アップロード動画</ButtonBase>
                     </div>
                   </div>
                   {camera?.source_type === 'video' ? (
                     <div className="media-controls">
                       <div className="media-control-buttons">
-                        <button className="button button-primary" disabled={!currentVideo} onClick={() => playbackAction('play')} type="button">
-                          ▶ 再生
-                        </button>
-                        <button className="button button-quiet" disabled={!currentVideo} onClick={() => playbackAction('pause')} type="button">
-                          Ⅱ 一時停止
-                        </button>
-                        <button className="button button-quiet" disabled={!currentVideo} onClick={() => playbackAction('restart')} type="button">
-                          ↺ 先頭から
-                        </button>
-                        <button className="button button-quiet" disabled={!currentVideo} onClick={() => playbackAction('stop')} type="button">
-                          ■ 停止
-                        </button>
+                        <AppButton className="button button-primary" disabled={!currentVideo} onClick={() => playbackAction('play')} startIcon={<PlayArrowRounded />} type="button">
+                          再生
+                        </AppButton>
+                        <AppButton className="button button-quiet" disabled={!currentVideo} onClick={() => playbackAction('pause')} startIcon={<PauseRounded />} type="button">
+                          一時停止
+                        </AppButton>
+                        <AppButton className="button button-quiet" disabled={!currentVideo} onClick={() => playbackAction('restart')} startIcon={<ReplayRounded />} type="button">
+                          先頭から
+                        </AppButton>
+                        <AppButton className="button button-quiet" disabled={!currentVideo} onClick={() => playbackAction('stop')} startIcon={<StopRounded />} type="button">
+                          停止
+                        </AppButton>
                       </div>
-                      <label className="toggle-row loop-toggle">
-                        <span>ループ再生</span>
-                        <input checked={playback?.loop ?? true} onChange={(event) => setLoop(event.target.checked)} type="checkbox" />
-                        <i />
-                      </label>
+                      <FormControlLabel
+                        className="toggle-row loop-toggle"
+                        control={(
+                          <MuiSwitch
+                            checked={playback?.loop ?? true}
+                            onChange={(event) => setLoop(event.target.checked)}
+                          />
+                        )}
+                        label="ループ再生"
+                      />
                     </div>
                   ) : (
                     <div className="camera-controls">
@@ -1102,25 +1234,28 @@ function App() {
                         {insta360?.error ? ` · ${insta360.error}` : ''}
                       </span>
                       {camera?.status === 'connected' || camera?.status === 'connecting' ? (
-                        <button className="button button-quiet" onClick={disconnectInsta360} type="button">切断</button>
+                        <AppButton className="button button-quiet" onClick={disconnectInsta360} type="button">切断</AppButton>
                       ) : (
-                        <button className="button button-primary" onClick={connectInsta360} type="button">接続開始</button>
+                        <AppButton className="button button-primary" onClick={connectInsta360} type="button">接続開始</AppButton>
                       )}
                     </div>
                   )}
                   {camera?.source_type === 'video' && (
                     <div className="video-library-controls">
-                      <label className="field video-select">
-                        <span>登録済み動画を選択</span>
-                        <select onChange={selectVideo} value={camera?.active_video_id || ''}>
-                          <option value="">動画を選択…</option>
-                          {videos.map((video) => (
-                            <option key={video.id} value={video.id}>
-                              {video.name} · {formatTime(video.duration_ms)}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
+                      <MuiTextField
+                        className="video-select"
+                        label="登録済み動画を選択"
+                        onChange={selectVideo}
+                        select
+                        value={camera?.active_video_id || ''}
+                      >
+                        <MenuItem value="">動画を選択…</MenuItem>
+                        {videos.map((video) => (
+                          <MenuItem key={video.id} value={video.id}>
+                            {video.name} · {formatTime(video.duration_ms)}
+                          </MenuItem>
+                        ))}
+                      </MuiTextField>
                       <label className="button button-outline upload-button">
                         <input accept=".mp4,video/mp4" onChange={handleVideoUpload} type="file" />
                         ＋ MP4 を追加
@@ -1132,12 +1267,13 @@ function App() {
                       <span>{currentVideo.width && currentVideo.height ? `${currentVideo.width} × ${currentVideo.height}` : '解像度不明'}</span>
                       <span>{currentVideo.fps ? `${currentVideo.fps.toFixed(2)} FPS` : 'FPS 不明'}</span>
                       <span>{formatBytes(currentVideo.file_size)}</span>
-                      <button
+                      <AppButton
                         className="text-button danger-text"
                         disabled={playback?.status === 'playing'}
                         onClick={() => removeVideo(currentVideo.id)}
                         type="button"
-                      >動画を削除</button>
+                        startIcon={<DeleteOutlineRounded />}
+                      >動画を削除</AppButton>
                     </div>
                   )}
                   {uploadProgress !== null && (
@@ -1174,10 +1310,10 @@ function App() {
                     </div>
                   )}
                   <div className="audio-actions">
-                    <button className="button button-outline" onClick={audioUnlocked ? toggleAudio : unlockAudio} type="button">
+                    <AppButton className="button button-outline" onClick={audioUnlocked ? toggleAudio : unlockAudio} startIcon={<VolumeUpOutlined />} type="button">
                       {audioUnlocked ? `音声 ${settings?.audio_enabled ? 'ON' : 'OFF'}` : '♫ 音声を有効化'}
-                    </button>
-                    <button className="button button-quiet" onClick={testAlert} type="button">テスト発報</button>
+                    </AppButton>
+                    <AppButton className="button button-quiet" onClick={testAlert} type="button">テスト発報</AppButton>
                   </div>
                   <p className="helper-text">
                     {audioUnlocked
@@ -1192,9 +1328,9 @@ function App() {
                       <span className="eyebrow">AND CONDITIONS</span>
                       <h2>アラートルール <span className="heading-count">{rules.length}</span></h2>
                     </div>
-                    <button className="button button-small button-outline" onClick={() => setEditingRule(null)} type="button">
+                    <AppButton className="button button-small button-outline" onClick={() => setEditingRule(null)} type="button">
                       ＋ 追加
-                    </button>
+                    </AppButton>
                   </div>
                   {editingRule !== undefined && (
                     <RuleEditor
@@ -1213,10 +1349,12 @@ function App() {
                     {rules.map((rule) => (
                       <article className={`rule-item ${rule.incompatible ? 'is-incompatible' : ''}`} key={rule.id}>
                         <div className="rule-main">
-                          <label className="mini-switch" title={rule.enabled ? 'ルールを無効化' : 'ルールを有効化'}>
-                            <input checked={rule.enabled} onChange={() => toggleRule(rule)} type="checkbox" />
-                            <i />
-                          </label>
+                          <MuiSwitch
+                            checked={rule.enabled}
+                            slotProps={{ input: { 'aria-label': rule.enabled ? 'ルールを無効化' : 'ルールを有効化' } }}
+                            onChange={() => toggleRule(rule)}
+                            size="small"
+                          />
                           <div className="rule-info">
                             <strong>{rule.name}</strong>
                             <div className="class-tags">
@@ -1236,8 +1374,8 @@ function App() {
                           <span>成立 {rule.detection_duration_ms} ms</span>
                           <span>解除 {rule.release_duration_ms} ms</span>
                           <div>
-                            <button className="text-button" onClick={() => setEditingRule(rule)} type="button">編集</button>
-                            <button className="text-button danger-text" onClick={() => deleteRule(rule)} type="button">削除</button>
+                            <AppButton className="text-button" onClick={() => setEditingRule(rule)} startIcon={<EditOutlined />} type="button">編集</AppButton>
+                            <AppButton className="text-button danger-text" onClick={() => deleteRule(rule)} startIcon={<DeleteOutlineRounded />} type="button">削除</AppButton>
                           </div>
                         </div>
                       </article>
@@ -1248,7 +1386,7 @@ function App() {
                 <section className="panel recent-panel">
                   <div className="panel-heading">
                     <div><span className="eyebrow">RECENT EVENTS</span><h2>最近の発報</h2></div>
-                    <button className="text-button" onClick={() => setPage('alerts')} type="button">すべて見る →</button>
+                    <AppButton className="text-button" onClick={() => setPage('alerts')} type="button">すべて見る →</AppButton>
                   </div>
                   {history.length ? (
                     <div className="recent-list">
@@ -1265,6 +1403,12 @@ function App() {
               </aside>
             </div>
           </div>
+        )}
+
+        {page === 'quiz' && (
+          <Suspense fallback={<div className="empty-list">教材画面を読み込んでいます…</div>}>
+            <QuizPage onBack={() => setPage('dashboard')} />
+          </Suspense>
         )}
 
         {page === 'models' && (
@@ -1322,16 +1466,17 @@ function App() {
                       </div>
                       <div className="model-actions">
                         {!model.active && (
-                          <button className="button button-primary" onClick={() => activateModel(model)} type="button">
+                          <AppButton className="button button-primary" onClick={() => activateModel(model)} type="button">
                             このモデルを有効化
-                          </button>
+                          </AppButton>
                         )}
-                        <button
+                        <AppButton
                           className="text-button danger-text"
                           disabled={model.active}
                           onClick={() => removeModel(model)}
                           type="button"
-                        >削除</button>
+                          startIcon={<DeleteOutlineRounded />}
+                        >削除</AppButton>
                       </div>
                     </article>
                   ))}
@@ -1350,38 +1495,33 @@ function App() {
               </div>
               <form className="settings-form" onSubmit={saveInsta360}>
                 <div className="settings-grid">
-                  <label className="field">
-                    <span>カメラ IPv4 アドレス</span>
-                    <input
-                      onChange={(event) => setInsta360Draft((current) => ({ ...current, camera_ip: event.target.value }))}
-                      placeholder="192.168.42.1"
-                      value={insta360Draft?.camera_ip ?? '192.168.42.1'}
-                    />
-                  </label>
-                  <label className="field">
-                    <span>TCP ポート</span>
-                    <input
-                      max="65535"
-                      min="1"
-                      onChange={(event) => setInsta360Draft((current) => ({ ...current, tcp_port: Number(event.target.value) }))}
-                      type="number"
-                      value={insta360Draft?.tcp_port ?? 6666}
-                    />
-                  </label>
-                  <label className="field">
-                    <span>再接続間隔 (ms)</span>
-                    <input
-                      max="60000"
-                      min="500"
-                      onChange={(event) => setInsta360Draft((current) => ({ ...current, reconnect_interval_ms: Number(event.target.value) }))}
-                      type="number"
-                      value={insta360Draft?.reconnect_interval_ms ?? 3000}
-                    />
-                  </label>
+                  <MuiTextField
+                    fullWidth
+                    label="カメラ IPv4 アドレス"
+                    onChange={(event) => setInsta360Draft((current) => ({ ...current, camera_ip: event.target.value }))}
+                    placeholder="192.168.42.1"
+                    value={insta360Draft?.camera_ip ?? '192.168.42.1'}
+                  />
+                  <MuiTextField
+                    fullWidth
+                    label="TCP ポート"
+                    onChange={(event) => setInsta360Draft((current) => ({ ...current, tcp_port: Number(event.target.value) }))}
+                    slotProps={{ htmlInput: { max: 65535, min: 1 } }}
+                    type="number"
+                    value={insta360Draft?.tcp_port ?? 6666}
+                  />
+                  <MuiTextField
+                    fullWidth
+                    label="再接続間隔 (ms)"
+                    onChange={(event) => setInsta360Draft((current) => ({ ...current, reconnect_interval_ms: Number(event.target.value) }))}
+                    slotProps={{ htmlInput: { max: 60000, min: 500 } }}
+                    type="number"
+                    value={insta360Draft?.reconnect_interval_ms ?? 3000}
+                  />
                 </div>
                 <p className="helper-text">GO Ultra の Wi-Fi には OS 側で接続してください。接続・切断はダッシュボードから操作できます。</p>
                 <div className="form-actions">
-                  <button className="button button-primary" type="submit">Insta360 設定を保存</button>
+                  <AppButton className="button button-primary" type="submit">Insta360 設定を保存</AppButton>
                   <span className={`state-chip ${statusClass(insta360?.status)}`}>
                     <i />{statusNames[insta360?.status] || '未接続'}
                   </span>
@@ -1396,31 +1536,51 @@ function App() {
               </div>
               <form className="settings-form" onSubmit={saveSettings}>
                 <div className="settings-grid">
-                  <label className="field">
-                    <span>Confidence</span>
-                    <input max="1" min="0" onChange={(event) => changeInferenceNumber('confidence', event.target.value)} step="0.01" type="number" value={settingsDraft?.confidence ?? 0.4} />
-                    <small>信頼度の下限 (0〜1)</small>
-                  </label>
-                  <label className="field">
-                    <span>NMS IoU</span>
-                    <input max="1" min="0" onChange={(event) => changeInferenceNumber('iou_threshold', event.target.value)} step="0.01" type="number" value={settingsDraft?.iou_threshold ?? 0.7} />
-                    <small>重複ボックス抑制 (0〜1)</small>
-                  </label>
-                  <label className="field">
-                    <span>画像サイズ (imgsz)</span>
-                    <input max="2048" min="32" onChange={(event) => changeInferenceNumber('imgsz', event.target.value)} step="32" type="number" value={settingsDraft?.imgsz ?? 416} />
-                    <small>モデル互換の整数値</small>
-                  </label>
-                  <label className="field">
-                    <span>目標推論 FPS</span>
-                    <input max="60" min="0.1" onChange={(event) => changeInferenceNumber('target_fps', event.target.value)} step="0.5" type="number" value={settingsDraft?.target_fps ?? 5} />
-                    <small>上限目標。性能保証値ではありません。</small>
-                  </label>
-                  <label className="field">
-                    <span>アラート画像 JPEG 品質</span>
-                    <input max="100" min="1" onChange={(event) => changeInferenceNumber('jpeg_quality', event.target.value)} step="1" type="number" value={settingsDraft?.jpeg_quality ?? 80} />
-                    <small>履歴に保存する画像の品質 (1〜100)</small>
-                  </label>
+                  <MuiTextField
+                    fullWidth
+                    helperText="信頼度の下限 (0〜1)"
+                    label="Confidence"
+                    onChange={(event) => changeInferenceNumber('confidence', event.target.value)}
+                    slotProps={{ htmlInput: { max: 1, min: 0, step: 0.01 } }}
+                    type="number"
+                    value={settingsDraft?.confidence ?? 0.4}
+                  />
+                  <MuiTextField
+                    fullWidth
+                    helperText="重複ボックス抑制 (0〜1)"
+                    label="NMS IoU"
+                    onChange={(event) => changeInferenceNumber('iou_threshold', event.target.value)}
+                    slotProps={{ htmlInput: { max: 1, min: 0, step: 0.01 } }}
+                    type="number"
+                    value={settingsDraft?.iou_threshold ?? 0.7}
+                  />
+                  <MuiTextField
+                    fullWidth
+                    helperText="モデル互換の整数値"
+                    label="画像サイズ (imgsz)"
+                    onChange={(event) => changeInferenceNumber('imgsz', event.target.value)}
+                    slotProps={{ htmlInput: { max: 2048, min: 32, step: 32 } }}
+                    type="number"
+                    value={settingsDraft?.imgsz ?? 416}
+                  />
+                  <MuiTextField
+                    fullWidth
+                    helperText="上限目標。性能保証値ではありません。"
+                    label="目標推論 FPS"
+                    onChange={(event) => changeInferenceNumber('target_fps', event.target.value)}
+                    slotProps={{ htmlInput: { max: 60, min: 0.1, step: 0.5 } }}
+                    type="number"
+                    value={settingsDraft?.target_fps ?? 5}
+                  />
+                  <MuiTextField
+                    fullWidth
+                    helperText="履歴に保存する画像の品質 (1〜100)"
+                    label="アラート画像 JPEG 品質"
+                    onChange={(event) => changeInferenceNumber('jpeg_quality', event.target.value)}
+                    slotProps={{ htmlInput: { max: 100, min: 1, step: 1 } }}
+                    type="number"
+                    value={settingsDraft?.jpeg_quality ?? 80}
+                  />
                 </div>
                 <div className="display-options">
                   <span className="control-label">映像表示</span>
@@ -1429,21 +1589,38 @@ function App() {
                     ['show_labels', 'クラス名'],
                     ['show_confidence', 'Confidence'],
                   ].map(([key, label]) => (
-                    <label className="check-option" key={key}>
-                      <input checked={settingsDraft?.[key] ?? true} onChange={(event) => changeSetting(key, event.target.checked)} type="checkbox" />
-                      <span>{label}</span>
-                    </label>
+                    <FormControlLabel
+                      className="check-option"
+                      control={(
+                        <MuiCheckbox
+                          checked={settingsDraft?.[key] ?? true}
+                          onChange={(event) => changeSetting(key, event.target.checked)}
+                        />
+                      )}
+                      key={key}
+                      label={label}
+                    />
                   ))}
                 </div>
                 <div className="settings-footer">
-                  <label className="toggle-row">
-                    <span><strong>ブラウザ警告音</strong><small>音声の有効化はダッシュボードから操作します</small></span>
-                    <input checked={settingsDraft?.audio_enabled ?? true} onChange={(event) => changeSetting('audio_enabled', event.target.checked)} type="checkbox" />
-                    <i />
-                  </label>
-                  <button className="button button-primary" disabled={savingSettings} type="submit">
+                  <FormControlLabel
+                    className="toggle-row"
+                    control={(
+                      <MuiSwitch
+                        checked={settingsDraft?.audio_enabled ?? true}
+                        onChange={(event) => changeSetting('audio_enabled', event.target.checked)}
+                      />
+                    )}
+                    label={(
+                      <span>
+                        <strong>ブラウザ警告音</strong>
+                        <small>音声の有効化はダッシュボードから操作します</small>
+                      </span>
+                    )}
+                  />
+                  <AppButton className="button button-primary" disabled={savingSettings} type="submit">
                     {savingSettings ? '保存中…' : '設定を保存'}
-                  </button>
+                  </AppButton>
                 </div>
               </form>
             </section>
@@ -1466,8 +1643,8 @@ function App() {
               <div className="panel-heading">
                 <div><span className="eyebrow">EVENT LOG</span><h2>アラート履歴</h2></div>
                 <div className="panel-heading-actions">
-                  <button className="button button-outline" onClick={() => refreshData().catch(() => {})} type="button">更新</button>
-                  <button className="button button-quiet danger-text" disabled={history.length === 0} onClick={deleteAlertHistory} type="button">履歴を全件削除</button>
+                  <AppButton className="button button-outline" onClick={() => refreshData().catch(() => {})} startIcon={<RefreshRounded />} type="button">更新</AppButton>
+                  <AppButton className="button button-quiet danger-text" disabled={history.length === 0} onClick={deleteAlertHistory} startIcon={<DeleteOutlineRounded />} type="button">履歴を全件削除</AppButton>
                 </div>
               </div>
               {history.length === 0 ? (
@@ -1487,7 +1664,7 @@ function App() {
                           <td>{event.source_type === 'video' ? '動画' : 'Insta360 GO Ultra'}</td>
                           <td>{event.model_name || '不明'}</td>
                           <td>{event.media_time_ms === null ? '—' : formatTime(event.media_time_ms)}</td>
-                          <td><button className="text-button" onClick={() => loadAlertDetail(event.id)} type="button">表示</button></td>
+                          <td><AppButton className="text-button" onClick={() => loadAlertDetail(event.id)} type="button">表示</AppButton></td>
                         </tr>
                       ))}
                     </tbody>
@@ -1512,7 +1689,7 @@ function App() {
                         href={apiResourceUrl(`/alerts/${alertDetail.id}/frame`)}
                       >JPEG をダウンロード</a>
                     )}
-                    <button className="icon-button" onClick={() => setAlertDetail(null)} type="button" aria-label="詳細を閉じる">×</button>
+                    <AppIconButton className="icon-button" onClick={() => setAlertDetail(null)} type="button" aria-label="詳細を閉じる">×</AppIconButton>
                   </div>
                 </div>
                 {alertDetailLoading ? (

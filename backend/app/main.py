@@ -51,12 +51,14 @@ from .database import (
     Video,
     initialize_database,
 )
+from .education import generate_quiz_questions, render_quiz_image
 from .inference import Detector, ModelValidationError
 from .runtime import LiveRuntime, WebSocketHub
 from .schemas import (
     Insta360SettingsPatch,
     LoopPatch,
     PlaybackAction,
+    QuizGeneratePayload,
     RulePayload,
     SettingsPatch,
     SourcePatch,
@@ -94,6 +96,9 @@ def _rule_configuration(db: Session) -> list[dict[str, Any]]:
             "detection_duration_ms": rule.detection_duration_ms,
             "release_duration_ms": rule.release_duration_ms,
             "cooldown_ms": rule.cooldown_ms,
+            "education_target_class_name": rule.education_target_class_name,
+            "correct_reason": rule.correct_reason,
+            "explanation": rule.explanation,
         }
         for rule in records
     ]
@@ -147,6 +152,9 @@ def _serialize_rule(rule: AlertRule, statuses: dict[int, dict[str, Any]]) -> dic
         "detection_duration_ms": rule.detection_duration_ms,
         "release_duration_ms": rule.release_duration_ms,
         "cooldown_ms": rule.cooldown_ms,
+        "education_target_class_name": rule.education_target_class_name,
+        "correct_reason": rule.correct_reason,
+        "explanation": rule.explanation,
         "state": status["state"],
         "incompatible": status["incompatible"],
         "missing_class_names": status["missing_class_names"],
@@ -288,7 +296,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="動体展示用 AI 物体検出・アラートシステム",
-    version="0.5.1",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -842,6 +850,9 @@ def create_rule(payload: RulePayload, request: Request, db: Session = Depends(_g
         detection_duration_ms=payload.detection_duration_ms,
         release_duration_ms=payload.release_duration_ms,
         cooldown_ms=payload.cooldown_ms,
+        education_target_class_name=payload.education_target_class_name,
+        correct_reason=payload.correct_reason,
+        explanation=payload.explanation,
         classes=[AlertRuleClass(class_name=name) for name in payload.class_names],
     )
     db.add(rule)
@@ -865,6 +876,9 @@ def update_rule(
     rule.detection_duration_ms = payload.detection_duration_ms
     rule.release_duration_ms = payload.release_duration_ms
     rule.cooldown_ms = payload.cooldown_ms
+    rule.education_target_class_name = payload.education_target_class_name
+    rule.correct_reason = payload.correct_reason
+    rule.explanation = payload.explanation
     existing_classes = {item.class_name: item for item in rule.classes}
     requested_classes = set(payload.class_names)
     for class_name, item in existing_classes.items():
@@ -983,6 +997,21 @@ def get_alert(alert_id: int, db: Session = Depends(_get_db)):
             if frame is not None
             else None
         ),
+        "education": {
+            "target_detection_id": event.quiz_target_detection_id,
+            "correct_reason": event.quiz_correct_reason_snapshot,
+            "explanation": event.quiz_explanation_snapshot,
+            "crop_bbox": (
+                [
+                    event.crop_x1,
+                    event.crop_y1,
+                    event.crop_x2,
+                    event.crop_y2,
+                ]
+                if event.crop_x1 is not None
+                else None
+            ),
+        },
     }
 
 
@@ -1023,6 +1052,23 @@ def delete_alerts(db: Session = Depends(_get_db)):
 def test_alert(request: Request):
     request.app.state.runtime.test_alert()
     return {"sent": True}
+
+
+@app.post("/api/quiz/generate")
+def generate_quiz(payload: QuizGeneratePayload, db: Session = Depends(_get_db)):
+    return generate_quiz_questions(db, payload.max_questions)
+
+
+@app.get("/api/quiz/questions/{alert_event_id}/image")
+def get_quiz_image(alert_event_id: int, db: Session = Depends(_get_db)):
+    try:
+        image_jpeg = render_quiz_image(db, alert_event_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        logger.exception("Could not render quiz image")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return Response(content=image_jpeg, media_type="image/jpeg")
 
 
 @app.get("/api/settings")

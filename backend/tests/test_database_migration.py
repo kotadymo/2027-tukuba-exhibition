@@ -66,6 +66,16 @@ class DatabaseMigrationTests(unittest.TestCase):
                 }
                 self.assertIn("alert_frame_id", columns)
                 self.assertIn("matched_class_names_json", columns)
+                self.assertIn("quiz_target_detection_id", columns)
+                self.assertIn("quiz_correct_reason_snapshot", columns)
+                self.assertIn("crop_x1", columns)
+                rule_columns = {
+                    column["name"]
+                    for column in inspect(engine).get_columns("alert_rules")
+                }
+                self.assertIn("education_target_class_name", rule_columns)
+                self.assertIn("correct_reason", rule_columns)
+                self.assertIn("explanation", rule_columns)
                 with session_local() as db:
                     source = db.get(SourceSettings, 1)
                     legacy_event = db.scalar(
