@@ -23,14 +23,17 @@ import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import SchoolOutlined from '@mui/icons-material/SchoolOutlined'
 import SettingsOutlined from '@mui/icons-material/SettingsOutlined'
 import StopRounded from '@mui/icons-material/StopRounded'
+import PlaylistPlayRounded from '@mui/icons-material/PlaylistPlayRounded'
 import VolumeUpOutlined from '@mui/icons-material/VolumeUpOutlined'
 import { apiRequest, apiResourceUrl, liveSocketUrl, uploadFile } from './services/api.js'
 import './App.css'
 
 const QuizPage = lazy(() => import('./components/QuizPage.jsx'))
+const BatchJobsPage = lazy(() => import('./components/BatchJobsPage.jsx'))
 
 const navigation = [
   { id: 'dashboard', label: 'ダッシュボード', icon: <DashboardOutlined /> },
+  { id: 'batch-jobs', label: '一括推論', icon: <PlaylistPlayRounded /> },
   { id: 'quiz', label: '問題に挑戦', icon: <SchoolOutlined /> },
   { id: 'models', label: 'モデル管理', icon: <Inventory2Outlined /> },
   { id: 'hazard-reasons', label: '危険理由マスター', icon: <ReportProblemOutlined /> },
@@ -507,6 +510,8 @@ function App() {
   const [rules, setRules] = useState([])
   const [hazardReasons, setHazardReasons] = useState([])
   const [history, setHistory] = useState([])
+  const [batchJobs, setBatchJobs] = useState([])
+  const [alertFilterJobId, setAlertFilterJobId] = useState(null)
   const [alertDetail, setAlertDetail] = useState(null)
   const [alertDetailLoading, setAlertDetailLoading] = useState(false)
   const [activeAlerts, setActiveAlerts] = useState([])
@@ -529,13 +534,14 @@ function App() {
   const audioContextRef = useRef(null)
   const audioUnlockedRef = useRef(false)
   const settingsRef = useRef(null)
+  const alertFilterJobRef = useRef(null)
   const playSoundRef = useRef(() => {})
   const testAlertTimeoutRef = useRef(null)
 
-  const refreshData = useCallback(async () => {
+  const refreshData = useCallback(async (batchJobId = alertFilterJobRef.current) => {
     try {
       const [healthResult, sourceResult, insta360Result, settingsResult, modelsResult, activeModelResult,
-        videosResult, playbackResult, rulesResult, hazardReasonsResult, historyResult] = await Promise.all([
+        videosResult, playbackResult, rulesResult, hazardReasonsResult, historyResult, batchJobsResult] = await Promise.all([
         apiRequest('/health'),
         apiRequest('/source'),
         apiRequest('/insta360'),
@@ -546,7 +552,10 @@ function App() {
         apiRequest('/videos/playback'),
         apiRequest('/rules'),
         apiRequest('/hazard-reasons'),
-        apiRequest('/alerts?limit=50&offset=0'),
+        apiRequest(batchJobId
+          ? `/alerts?limit=50&offset=0&batch_job_id=${batchJobId}`
+          : '/alerts?limit=50&offset=0'),
+        apiRequest('/batch-jobs?limit=20&offset=0'),
       ])
       setHealth(healthResult)
       cameraSourceRef.current = sourceResult.source_type
@@ -560,6 +569,7 @@ function App() {
       setRules(rulesResult)
       setHazardReasons(hazardReasonsResult)
       setHistory(historyResult.items || [])
+      setBatchJobs(batchJobsResult)
       setSettingsDraft((current) => current || settingsResult)
       setInsta360Draft((current) => current || {
         camera_ip: insta360Result.camera_ip,
@@ -579,6 +589,30 @@ function App() {
     const timer = window.setTimeout(() => refreshData().catch(() => {}), 0)
     return () => window.clearTimeout(timer)
   }, [refreshData])
+
+  useEffect(() => {
+    alertFilterJobRef.current = alertFilterJobId
+  }, [alertFilterJobId])
+
+  useEffect(() => {
+    let disposed = false
+    let timer
+    const pollBatchJobs = async () => {
+      try {
+        const result = await apiRequest('/batch-jobs?limit=20&offset=0')
+        if (!disposed) setBatchJobs(result)
+      } catch (error) {
+        if (!disposed) setApiError(error.message)
+      } finally {
+        if (!disposed) timer = window.setTimeout(pollBatchJobs, 1500)
+      }
+    }
+    pollBatchJobs()
+    return () => {
+      disposed = true
+      window.clearTimeout(timer)
+    }
+  }, [])
 
   useEffect(() => {
     settingsRef.current = settings
@@ -839,6 +873,10 @@ function App() {
   const currentVideo = videos.find((video) => video.id === camera?.active_video_id)
   const latestAlert = activeAlerts.at(-1)
   const alertCount = history.length
+  const activeBatchJob = batchJobs.find(
+    (job) => job.status === 'pending' || job.status === 'running',
+  ) || null
+  const batchJobActive = activeBatchJob !== null
 
   const handleAction = async (action, successMessage = '') => {
     try {
@@ -1138,12 +1176,24 @@ function App() {
   }
 
   const deleteAlertHistory = () => {
+    if (alertFilterJobId !== null) return
     if (!window.confirm('すべてのアラート履歴と保存画像を削除しますか？この操作は取り消せません。')) return
     handleAction(async () => {
       await apiRequest('/alerts', { method: 'DELETE' })
       setAlertDetail(null)
       await refreshData()
     })
+  }
+
+  const openBatchJobAlerts = async (jobId) => {
+    setAlertFilterJobId(jobId)
+    setAlertDetail(null)
+    setPage('alerts')
+    try {
+      await refreshData(jobId)
+    } catch (error) {
+      setApiError(error.message)
+    }
   }
 
   const streamMessage = useMemo(() => {
@@ -1226,11 +1276,18 @@ function App() {
             <ButtonBase
               className={`nav-item ${page === item.id ? 'is-active' : ''}`}
               key={item.id}
-              onClick={() => setPage(item.id)}
+              onClick={() => {
+                if (item.id === 'alerts') {
+                  setAlertFilterJobId(null)
+                  refreshData(null).catch(() => {})
+                }
+                setPage(item.id)
+              }}
               type="button"
             >
               <span className="nav-icon">{item.icon}</span>
               <span>{item.label}</span>
+              {item.id === 'batch-jobs' && batchJobActive && <span className="nav-count batch-nav-count">進行</span>}
               {item.id === 'alerts' && alertCount > 0 && <span className="nav-count">{alertCount}</span>}
             </ButtonBase>
           ))}
@@ -1258,6 +1315,11 @@ function App() {
               <span className="status-dot" />
               {socketStatus === 'connected' ? 'システム稼働中' : '接続待ち'}
             </div>
+            {batchJobActive && (
+              <div className="batch-job-pill" role="status">
+                一括推論 #{activeBatchJob.id} · {activeBatchJob.status === 'running' ? '実行中' : '開始待ち'}
+              </div>
+            )}
             {page !== 'quiz' && (
               <AppButton
                 onClick={() => setPage('quiz')}
@@ -1384,11 +1446,13 @@ function App() {
                     <div className="segmented-control">
                       <ButtonBase
                         className={camera?.source_type === 'insta360' ? 'is-selected' : ''}
+                        disabled={batchJobActive}
                         onClick={() => changeSource('insta360')}
                         type="button"
                       >Insta360 GO Ultra（ライブ）</ButtonBase>
                       <ButtonBase
                         className={camera?.source_type === 'video' ? 'is-selected' : ''}
+                        disabled={batchJobActive}
                         onClick={() => changeSource('video')}
                         type="button"
                       >アップロード動画</ButtonBase>
@@ -1397,16 +1461,16 @@ function App() {
                   {camera?.source_type === 'video' ? (
                     <div className="media-controls">
                       <div className="media-control-buttons">
-                        <AppButton className="button button-primary" disabled={!currentVideo} onClick={() => playbackAction('play')} startIcon={<PlayArrowRounded />} type="button">
+                        <AppButton className="button button-primary" disabled={!currentVideo || batchJobActive} onClick={() => playbackAction('play')} startIcon={<PlayArrowRounded />} type="button">
                           再生
                         </AppButton>
-                        <AppButton className="button button-quiet" disabled={!currentVideo} onClick={() => playbackAction('pause')} startIcon={<PauseRounded />} type="button">
+                        <AppButton className="button button-quiet" disabled={!currentVideo || batchJobActive} onClick={() => playbackAction('pause')} startIcon={<PauseRounded />} type="button">
                           一時停止
                         </AppButton>
-                        <AppButton className="button button-quiet" disabled={!currentVideo} onClick={() => playbackAction('restart')} startIcon={<ReplayRounded />} type="button">
+                        <AppButton className="button button-quiet" disabled={!currentVideo || batchJobActive} onClick={() => playbackAction('restart')} startIcon={<ReplayRounded />} type="button">
                           先頭から
                         </AppButton>
-                        <AppButton className="button button-quiet" disabled={!currentVideo} onClick={() => playbackAction('stop')} startIcon={<StopRounded />} type="button">
+                        <AppButton className="button button-quiet" disabled={!currentVideo || batchJobActive} onClick={() => playbackAction('stop')} startIcon={<StopRounded />} type="button">
                           停止
                         </AppButton>
                       </div>
@@ -1415,6 +1479,7 @@ function App() {
                         control={(
                           <MuiSwitch
                             checked={playback?.loop ?? true}
+                            disabled={batchJobActive}
                             onChange={(event) => setLoop(event.target.checked)}
                           />
                         )}
@@ -1428,9 +1493,9 @@ function App() {
                         {insta360?.error ? ` · ${insta360.error}` : ''}
                       </span>
                       {camera?.status === 'connected' || camera?.status === 'connecting' ? (
-                        <AppButton className="button button-quiet" onClick={disconnectInsta360} type="button">切断</AppButton>
+                        <AppButton className="button button-quiet" disabled={batchJobActive} onClick={disconnectInsta360} type="button">切断</AppButton>
                       ) : (
-                        <AppButton className="button button-primary" onClick={connectInsta360} type="button">接続開始</AppButton>
+                        <AppButton className="button button-primary" disabled={batchJobActive} onClick={connectInsta360} type="button">接続開始</AppButton>
                       )}
                     </div>
                   )}
@@ -1438,6 +1503,7 @@ function App() {
                     <div className="video-library-controls">
                       <MuiTextField
                         className="video-select"
+                        disabled={batchJobActive}
                         label="登録済み動画を選択"
                         onChange={selectVideo}
                         select
@@ -1451,7 +1517,7 @@ function App() {
                         ))}
                       </MuiTextField>
                       <label className="button button-outline upload-button">
-                        <input accept=".mp4,video/mp4" onChange={handleVideoUpload} type="file" />
+                        <input accept=".mp4,video/mp4" disabled={batchJobActive} onChange={handleVideoUpload} type="file" />
                         ＋ MP4 を追加
                       </label>
                     </div>
@@ -1463,7 +1529,7 @@ function App() {
                       <span>{formatBytes(currentVideo.file_size)}</span>
                       <AppButton
                         className="text-button danger-text"
-                        disabled={playback?.status === 'playing'}
+                        disabled={playback?.status === 'playing' || batchJobActive}
                         onClick={() => removeVideo(currentVideo.id)}
                         type="button"
                         startIcon={<DeleteOutlineRounded />}
@@ -1583,7 +1649,15 @@ function App() {
                 <section className="panel recent-panel">
                   <div className="panel-heading">
                     <div><span className="eyebrow">RECENT EVENTS</span><h2>最近の発報</h2></div>
-                    <AppButton className="text-button" onClick={() => setPage('alerts')} type="button">すべて見る →</AppButton>
+                    <AppButton
+                      className="text-button"
+                      onClick={() => {
+                        setAlertFilterJobId(null)
+                        refreshData(null).catch(() => {})
+                        setPage('alerts')
+                      }}
+                      type="button"
+                    >すべて見る →</AppButton>
                   </div>
                   {history.length ? (
                     <div className="recent-list">
@@ -1605,6 +1679,19 @@ function App() {
         {page === 'quiz' && (
           <Suspense fallback={<div className="empty-list">教材画面を読み込んでいます…</div>}>
             <QuizPage onBack={() => setPage('dashboard')} />
+          </Suspense>
+        )}
+
+        {page === 'batch-jobs' && (
+          <Suspense fallback={<div className="empty-list">一括推論画面を読み込んでいます…</div>}>
+            <BatchJobsPage
+              activeModel={activeModel}
+              camera={camera}
+              onOpenAlerts={openBatchJobAlerts}
+              onOpenQuiz={() => setPage('quiz')}
+              playback={playback}
+              settings={settings}
+            />
           </Suspense>
         )}
 
@@ -1663,13 +1750,13 @@ function App() {
                       </div>
                       <div className="model-actions">
                         {!model.active && (
-                          <AppButton className="button button-primary" onClick={() => activateModel(model)} type="button">
+                          <AppButton className="button button-primary" disabled={batchJobActive} onClick={() => activateModel(model)} type="button">
                             このモデルを有効化
                           </AppButton>
                         )}
                         <AppButton
                           className="text-button danger-text"
-                          disabled={model.active}
+                          disabled={model.active || batchJobActive}
                           onClick={() => removeModel(model)}
                           type="button"
                           startIcon={<DeleteOutlineRounded />}
@@ -1781,7 +1868,10 @@ function App() {
               <div className="settings-grid device-setting-grid">
                 <MuiTextField
                   fullWidth
-                  helperText="Auto は CUDA を優先し、利用できない場合は CPU を使います。"
+                  disabled={batchJobActive}
+                  helperText={batchJobActive
+                    ? '一括推論ジョブ終了後にデバイスを変更できます。'
+                    : 'Auto は CUDA を優先し、利用できない場合は CPU を使います。'}
                   label="要求する推論モード"
                   onChange={(event) => changeSetting('requested_device', event.target.value)}
                   select
@@ -1855,7 +1945,7 @@ function App() {
                 </div>
                 <p className="helper-text">GO Ultra の Wi-Fi には OS 側で接続してください。接続・切断はダッシュボードから操作できます。</p>
                 <div className="form-actions">
-                  <AppButton className="button button-primary" type="submit">Insta360 設定を保存</AppButton>
+                  <AppButton className="button button-primary" disabled={batchJobActive} type="submit">Insta360 設定を保存</AppButton>
                   <span className={`state-chip ${statusClass(insta360?.status)}`}>
                     <i />{statusNames[insta360?.status] || '未接続'}
                   </span>
@@ -1978,10 +2068,24 @@ function App() {
           <div className="page-content narrow-page">
             <section className="panel history-panel">
               <div className="panel-heading">
-                <div><span className="eyebrow">EVENT LOG</span><h2>アラート履歴</h2></div>
+                <div>
+                  <span className="eyebrow">EVENT LOG</span>
+                  <h2>{alertFilterJobId ? `ジョブ #${alertFilterJobId} のアラート履歴` : 'アラート履歴'}</h2>
+                </div>
                 <div className="panel-heading-actions">
-                  <AppButton className="button button-outline" onClick={() => refreshData().catch(() => {})} startIcon={<RefreshRounded />} type="button">更新</AppButton>
-                  <AppButton className="button button-quiet danger-text" disabled={history.length === 0} onClick={deleteAlertHistory} startIcon={<DeleteOutlineRounded />} type="button">履歴を全件削除</AppButton>
+                  <AppButton className="button button-outline" onClick={() => refreshData(alertFilterJobId).catch(() => {})} startIcon={<RefreshRounded />} type="button">更新</AppButton>
+                  {alertFilterJobId !== null ? (
+                    <AppButton
+                      className="button button-quiet"
+                      onClick={() => {
+                        setAlertFilterJobId(null)
+                        refreshData(null).catch(() => {})
+                      }}
+                      type="button"
+                    >全履歴を表示</AppButton>
+                  ) : (
+                    <AppButton className="button button-quiet danger-text" disabled={history.length === 0} onClick={deleteAlertHistory} startIcon={<DeleteOutlineRounded />} type="button">履歴を全件削除</AppButton>
+                  )}
                 </div>
               </div>
               {history.length === 0 ? (
