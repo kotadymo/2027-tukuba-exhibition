@@ -14,6 +14,7 @@ from app.database import (
     AlertFrameDetection,
     AlertRule,
     Base,
+    HazardReason,
     ModelClass,
     ModelRecord,
     ModelSettings,
@@ -62,16 +63,34 @@ class EducationTests(unittest.TestCase):
 
     def test_quiz_generation_deduplicates_frames_and_maps_crop_coordinates(self):
         with Session(self.engine) as db:
+            reasons = [
+                HazardReason(
+                    id=1,
+                    name="hand hazard",
+                    correct_reason="手が工具に近づいているため",
+                    wrong_reason="工具の色が明るいため",
+                    explanation="工具の可動部に巻き込まれる危険があります。",
+                ),
+                HazardReason(
+                    id=2,
+                    name="PPE hazard",
+                    correct_reason="保護具を着用していないため",
+                    wrong_reason="作業台が広いため",
+                    explanation="必要な保護具を着用してください。",
+                ),
+            ]
+            db.add_all(reasons)
+            db.flush()
             rules = [
                 AlertRule(
                     id=1,
                     name="hand + tool",
-                    correct_reason="手が工具に近づいているため",
+                    hazard_reason_id=1,
                 ),
                 AlertRule(
                     id=2,
                     name="person + tool",
-                    correct_reason="人が保護具を着用していないため",
+                    hazard_reason_id=2,
                 ),
             ]
             db.add_all(rules)
@@ -102,6 +121,10 @@ class EducationTests(unittest.TestCase):
                 for question in response["questions"]
             }
             self.assertEqual(rule_ids, {1, 2})
+            self.assertEqual(
+                {question["hazard_reason_id"] for question in response["questions"]},
+                {1, 2},
+            )
             for question in response["questions"]:
                 self.assertEqual(len(question["choices"]), 2)
                 self.assertEqual(question["correct_choice_id"], "correct")
@@ -168,24 +191,70 @@ class EducationTests(unittest.TestCase):
                 ]
             )
 
+        master_payload = {
+            "name": "moving tool",
+            "correct_reason": "手が工具に近づいているため",
+            "wrong_reason": "工具の色が明るいため",
+            "explanation": "工具の可動部に巻き込まれる危険があります。",
+            "enabled": True,
+        }
+        created_master = self.client.post("/api/hazard-reasons", json=master_payload)
+        self.assertEqual(created_master.status_code, 201)
+        hazard_reason_id = created_master.json()["id"]
+        self.assertEqual(created_master.json()["reference_rule_count"], 0)
+        self.assertEqual(
+            self.client.post(
+                "/api/hazard-reasons",
+                json={
+                    **master_payload,
+                    "name": "duplicate correct answer",
+                    "correct_reason": "  手が工具に近づいているため ",
+                    "wrong_reason": "別の誤答",
+                },
+            ).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/hazard-reasons",
+                json={
+                    **master_payload,
+                    "correct_reason": "同じ 文章",
+                    "wrong_reason": "同じ   文章",
+                },
+            ).status_code,
+            422,
+        )
+
         payload = {
             "name": "hand + tool",
             "class_names": ["hand", "tool"],
             "education_target_class_name": "hand",
-            "correct_reason": "手が工具に近づいているため",
-            "explanation": "工具の可動部に巻き込まれる危険があります。",
+            "hazard_reason_id": hazard_reason_id,
         }
         created = self.client.post("/api/rules", json=payload)
         self.assertEqual(created.status_code, 201)
         rule = created.json()
         self.assertEqual(rule["education_target_class_name"], "hand")
-        self.assertEqual(rule["correct_reason"], payload["correct_reason"])
-        self.assertEqual(rule["explanation"], payload["explanation"])
+        self.assertEqual(rule["hazard_reason_id"], hazard_reason_id)
+
+        shared_rule = self.client.post(
+            "/api/rules",
+            json={**payload, "name": "second rule using shared reason"},
+        )
+        self.assertEqual(shared_rule.status_code, 201)
+        self.assertEqual(
+            self.client.get("/api/hazard-reasons").json()[0]["reference_rule_count"],
+            2,
+        )
+        self.assertEqual(
+            self.client.delete(f"/api/hazard-reasons/{hazard_reason_id}").status_code,
+            409,
+        )
 
         updated_payload = {
             **payload,
             "education_target_class_name": "tool",
-            "correct_reason": "工具の回転部に近づいているため",
         }
         updated = self.client.put(
             f"/api/rules/{rule['id']}",
@@ -193,7 +262,7 @@ class EducationTests(unittest.TestCase):
         )
         self.assertEqual(updated.status_code, 200)
         self.assertEqual(updated.json()["education_target_class_name"], "tool")
-        self.assertEqual(updated.json()["correct_reason"], updated_payload["correct_reason"])
+        self.assertEqual(updated.json()["hazard_reason_id"], hazard_reason_id)
 
         invalid = {
             **payload,
@@ -201,23 +270,84 @@ class EducationTests(unittest.TestCase):
         }
         self.assertEqual(self.client.post("/api/rules", json=invalid).status_code, 422)
 
-    def test_quiz_is_unavailable_without_another_rule_reason(self):
+    def test_quiz_without_events_reports_no_saved_material(self):
         with Session(self.engine) as db:
-            rule = AlertRule(
+            response = generate_quiz_questions(db, 3)
+            self.assertEqual(response["questions"], [])
+            self.assertEqual(response["available_question_count"], 0)
+            self.assertEqual(response["unavailable_reason"], "危険フレームがまだありません")
+
+    def test_same_reason_can_fill_three_questions_from_distinct_events(self):
+        with Session(self.engine) as db:
+            reason = HazardReason(
                 id=1,
-                name="hand + tool",
+                name="shared reason",
                 correct_reason="手が工具に近づいているため",
+                wrong_reason="工具の色が明るいため",
+                explanation="工具の可動部に巻き込まれる危険があります。",
             )
-            db.add(rule)
+            rule = AlertRule(id=1, name="hand + tool", hazard_reason=reason)
+            db.add_all([reason, rule])
+            db.flush()
+            for frame_id in (1, 2, 3):
+                frame, target = self._frame(db, frame_id)
+                db.add(self._event(frame, target, rule, frame_id))
+            db.commit()
+
+            response = generate_quiz_questions(db, 3)
+            self.assertEqual(response["available_question_count"], 3)
+            event_ids = [question["alert_event_id"] for question in response["questions"]]
+            self.assertEqual(len(set(event_ids)), 3)
+            frame_ids = {
+                db.get(AlertEvent, event_id).alert_frame_id for event_id in event_ids
+            }
+            self.assertEqual(len(frame_ids), 3)
+            self.assertEqual(
+                {question["hazard_reason_id"] for question in response["questions"]},
+                {reason.id},
+            )
+
+    def test_quiz_generation_does_not_select_jpeg_blobs(self):
+        from sqlalchemy import event as sqlalchemy_event
+
+        with Session(self.engine) as db:
+            reason = HazardReason(
+                id=1,
+                name="shared reason",
+                correct_reason="手が工具に近づいているため",
+                wrong_reason="工具の色が明るいため",
+                explanation="工具の可動部に巻き込まれる危険があります。",
+            )
+            rule = AlertRule(id=1, name="hand + tool", hazard_reason=reason)
+            db.add_all([reason, rule])
             db.flush()
             frame, target = self._frame(db, 1)
             db.add(self._event(frame, target, rule, 1))
             db.commit()
 
-            response = generate_quiz_questions(db, 3)
-            self.assertEqual(response["questions"], [])
-            self.assertEqual(response["available_question_count"], 0)
-            self.assertEqual(response["unavailable_reason"], "2択用の理由が不足しています")
+            statements = []
+
+            def capture_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
+                statements.append(statement.lower())
+
+            sqlalchemy_event.listen(self.engine, "before_cursor_execute", capture_statement)
+            try:
+                generate_quiz_questions(db, 3)
+            finally:
+                sqlalchemy_event.remove(
+                    self.engine,
+                    "before_cursor_execute",
+                    capture_statement,
+                )
+            quiz_selects = [
+                statement
+                for statement in statements
+                if "select" in statement and "alert_events" in statement
+            ]
+            self.assertTrue(quiz_selects)
+            self.assertTrue(
+                all("image_jpeg" not in statement for statement in quiz_selects)
+            )
 
     def _frame(self, db, frame_id):
         frame = AlertFrame(
@@ -259,13 +389,15 @@ class EducationTests(unittest.TestCase):
         return AlertEvent(
             alert_frame_id=frame.id,
             rule_id=rule.id,
+            hazard_reason_id=rule.hazard_reason_id,
             rule_name_snapshot=rule.name,
             detected_classes_json='["hand", "tool"]',
             matched_class_names_json='["hand", "tool"]',
             event_type="alert_started",
             source_type="video",
             quiz_target_detection_id=target.id,
-            quiz_correct_reason_snapshot=rule.correct_reason,
+            quiz_correct_reason_snapshot="手が工具に近づいているため",
+            quiz_wrong_reason_snapshot="工具の色が明るいため",
             quiz_explanation_snapshot="正しい理由を理解して、事故を防止します。",
             crop_x1=10,
             crop_y1=10,

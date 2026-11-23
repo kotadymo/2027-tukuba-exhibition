@@ -2455,3 +2455,253 @@ td:first-child {
     font-size: 11px;
   }
 }
+
+.hazard-reason-list {
+  display: grid;
+  gap: 14px;
+  margin-top: 20px;
+}
+
+.hazard-reason-card {
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--panel-raised);
+}
+
+.hazard-reason-card.is-disabled {
+  opacity: 0.72;
+}
+
+.hazard-reason-heading,
+.hazard-reason-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.hazard-reason-heading h3 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.reference-count {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.hazard-reason-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.reason-enabled-control {
+  margin: 0 !important;
+}
+
+.reason-enabled-control .MuiFormControlLabel-label,
+.rule-enabled-control .MuiFormControlLabel-label {
+  font-size: 14px;
+}
+
+.reason-preview-pair,
+.device-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.reason-preview-pair > div,
+.device-status-grid > div,
+.reason-preview-choice {
+  display: grid;
+  gap: 7px;
+  padding: 15px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.reason-preview-pair strong,
+.device-status-grid span,
+.reason-preview-choice strong {
+  color: var(--muted-2);
+  font-size: 13px;
+}
+
+.reason-preview-pair span,
+.reason-preview-choice span,
+.hazard-reason-explanation {
+  font-size: 15px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.hazard-reason-explanation {
+  margin: 15px 0 0;
+  color: var(--muted-2);
+}
+
+.reason-preview {
+  display: grid;
+  gap: 10px;
+  padding: 18px;
+  border: 1px solid var(--border-soft);
+  border-radius: 18px;
+  background: rgba(195, 245, 106, 0.035);
+}
+
+.reason-preview > p {
+  margin: 4px 0 0;
+  line-height: 1.6;
+}
+
+.reason-preview > small {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.reason-preview-inline {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  color: var(--muted-2);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.inference-device-panel .section-icon svg {
+  width: 25px;
+  height: 25px;
+}
+
+.device-setting-grid {
+  grid-template-columns: minmax(260px, 0.8fr) minmax(0, 1.8fr);
+  align-items: start;
+}
+
+.device-status-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 0;
+}
+
+.device-status-grid strong {
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+
+.device-notice {
+  margin-top: 14px;
+}
+
+.notice-warning {
+  border-color: rgba(240, 191, 104, 0.32);
+  background: rgba(240, 191, 104, 0.09);
+  color: var(--amber);
+}
+
+.notice-warning > span {
+  color: var(--amber);
+}
+
+.hazard-reasons-page .panel > .section-description {
+  max-width: 900px;
+}
+
+.button-small,
+.text-button {
+  min-height: 48px;
+}
+
+@media (min-width: 901px) {
+  .nav-item {
+    min-height: 48px;
+    font-size: 14px;
+  }
+
+  .metric-label,
+  .metric-status,
+  .metric-caption,
+  .helper-text,
+  .subtle-text,
+  .source-url,
+  .rule-foot,
+  .reference-count {
+    font-size: 14px;
+  }
+
+  .table-scroll th,
+  .table-scroll td {
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 900px) {
+  .device-setting-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .device-status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .hazard-reason-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .hazard-reason-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 640px) {
+  .sidebar {
+    height: 64px;
+  }
+
+  .side-nav {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .nav-item {
+    min-height: 50px;
+    height: 50px;
+    font-size: 8px;
+  }
+
+  .nav-item > span:not(.nav-icon) {
+    max-width: 100%;
+    line-height: 1.05;
+    text-align: center;
+  }
+
+  .nav-icon {
+    height: 21px;
+  }
+
+  .main-area {
+    padding-bottom: 83px;
+  }
+
+  .reason-preview-pair,
+  .device-status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hazard-reason-card {
+    padding: 16px;
+  }
+
+  .hazard-reason-actions {
+    gap: 4px;
+  }
+}

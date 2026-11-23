@@ -12,10 +12,12 @@ from app.database import (
     AlertFrame,
     AlertFrameDetection,
     Base,
+    HazardReason,
     Insta360Settings,
     SourceSettings,
 )
 from app.inference import Detection
+from app.inference import CUDAUnavailableError
 from app.main import _get_db, app
 
 
@@ -133,11 +135,21 @@ class AlertStorageTests(unittest.TestCase):
         event = self._events()[0]
         event.update(
             education_target_class_name="hand",
+            hazard_reason_id=5,
             correct_reason="手が工具に近づいているため",
+            wrong_reason="工具の色が明るいため",
             explanation="工具の可動部に巻き込まれる危険があります。",
         )
         with Session(self.engine) as db:
+            reason = HazardReason(
+                id=5,
+                name="moving tool",
+                correct_reason="手が工具に近づいているため",
+                wrong_reason="工具の色が明るいため",
+                explanation="工具の可動部に巻き込まれる危険があります。",
+            )
             with db.begin():
+                db.add(reason)
                 self._persist(
                     db,
                     [event],
@@ -149,11 +161,21 @@ class AlertStorageTests(unittest.TestCase):
                     ],
                 )
 
+            reason.correct_reason = "後から編集された正解理由"
+            db.commit()
             saved = db.scalar(select(AlertEvent))
             self.assertIsNotNone(saved.quiz_target_detection_id)
             self.assertEqual(
+                saved.hazard_reason_id,
+                5,
+            )
+            self.assertEqual(
                 saved.quiz_correct_reason_snapshot,
                 "手が工具に近づいているため",
+            )
+            self.assertEqual(
+                saved.quiz_wrong_reason_snapshot,
+                "工具の色が明るいため",
             )
             self.assertEqual(
                 saved.quiz_explanation_snapshot,
@@ -253,9 +275,26 @@ class AlertApiTests(unittest.TestCase):
         self.assertTrue(all(item["model_name"] == "API model" for item in items))
 
         alert_id = self.saved_events[0]["alert_id"]
+        with self.session_factory.begin() as db:
+            event = db.get(AlertEvent, alert_id)
+            event.hazard_reason_id = 9
+            event.quiz_correct_reason_snapshot = "発報時の正解理由"
+            event.quiz_wrong_reason_snapshot = "発報時の誤答理由"
+            event.quiz_explanation_snapshot = "発報時の解説"
         detail = self.client.get(f"/api/alerts/{alert_id}")
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(detail.json()["frame"]["frame_id"], 38)
+        self.assertEqual(
+            detail.json()["education"],
+            {
+                "target_detection_id": None,
+                "hazard_reason_id": 9,
+                "correct_reason": "発報時の正解理由",
+                "wrong_reason": "発報時の誤答理由",
+                "explanation": "発報時の解説",
+                "crop_bbox": None,
+            },
+        )
         self.assertEqual(
             [item["class_name"] for item in detail.json()["frame"]["detections"]],
             ["hand", "tool"],
@@ -315,17 +354,53 @@ class AlertApiTests(unittest.TestCase):
         self.assertEqual(updated_settings.json()["jpeg_quality"], 65)
         self.assertEqual(app.state.runtime.inference_settings, {"jpeg_quality": 65})
 
+        rejected_device = self.client.patch(
+            "/api/settings",
+            json={"requested_device": "cuda"},
+        )
+        self.assertEqual(rejected_device.status_code, 409)
+        self.assertEqual(
+            self.client.get("/api/settings").json()["requested_device"],
+            "auto",
+        )
+
 
 class _FakeRuntime:
     def __init__(self):
         self.capture = _FakeCapture()
         self.inference_settings = {}
+        self.requested_device = "auto"
+        self.device_status = {
+            "cuda_available": False,
+            "cuda_device_count": 0,
+            "gpu_name": None,
+            "cuda_error": None,
+            "requested_device": "auto",
+            "effective_device": "none",
+            "fallback_reason": None,
+            "device_error": None,
+            "model_error": None,
+            "model_ready": False,
+            "inference_fps": 0.0,
+            "processing_ms": None,
+        }
 
     def source_snapshot(self):
         return self.capture.snapshot
 
     def set_inference_settings(self, settings):
         self.inference_settings.update(settings)
+
+    def get_device_status(self):
+        return self.device_status
+
+    async def switch_device(self, requested_device, persist):
+        if requested_device == "cuda":
+            raise CUDAUnavailableError("CUDA is unavailable in this test")
+        persist()
+        self.requested_device = requested_device
+        self.device_status["requested_device"] = requested_device
+        return self.device_status
 
 
 class _FakeCapture:

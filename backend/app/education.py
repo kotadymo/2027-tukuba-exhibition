@@ -4,8 +4,8 @@ import random
 
 import cv2
 import numpy as np
-from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from .database import AlertEvent, AlertFrame, AlertFrameDetection, AlertRule
 
@@ -14,39 +14,36 @@ MIN_TARGET_SIDE_PX = 6.0
 TARGET_IMAGE_SIDE_PX = 64.0
 MAX_UPSCALE = 4.0
 MAX_IMAGE_EDGE_PX = 2048
+QUIZ_METADATA_PAGE_SIZE = 100
+MAX_QUIZ_METADATA_ROWS = 5000
 
 
-def _quiz_geometry(event: AlertEvent) -> dict[str, object] | None:
-    frame = event.frame
-    if frame is None or not frame.image_jpeg or event.quiz_target_detection_id is None:
-        return None
-    if any(
-        value is None
-        for value in (event.crop_x1, event.crop_y1, event.crop_x2, event.crop_y2)
-    ):
-        return None
-    detection = next(
-        (
-            item
-            for item in frame.detections
-            if item.id == event.quiz_target_detection_id
-        ),
-        None,
-    )
-    if detection is None:
-        return None
-
-    crop_x1 = max(0, min(frame.width, int(event.crop_x1)))
-    crop_y1 = max(0, min(frame.height, int(event.crop_y1)))
-    crop_x2 = max(0, min(frame.width, int(event.crop_x2)))
-    crop_y2 = max(0, min(frame.height, int(event.crop_y2)))
+def _quiz_geometry(
+    *,
+    width: int,
+    height: int,
+    crop_x1: float,
+    crop_y1: float,
+    crop_x2: float,
+    crop_y2: float,
+    target_x1: float,
+    target_y1: float,
+    target_x2: float,
+    target_y2: float,
+) -> dict[str, object] | None:
+    crop_x1 = max(0, min(width, int(crop_x1)))
+    crop_y1 = max(0, min(height, int(crop_y1)))
+    crop_x2 = max(0, min(width, int(crop_x2)))
+    crop_y2 = max(0, min(height, int(crop_y2)))
     crop_width = crop_x2 - crop_x1
     crop_height = crop_y2 - crop_y1
-    target_width = detection.x2 - detection.x1
-    target_height = detection.y2 - detection.y1
+    target_width = target_x2 - target_x1
+    target_height = target_y2 - target_y1
     if (
         crop_width <= 0
         or crop_height <= 0
+        or width <= 0
+        or height <= 0
         or min(target_width, target_height) < MIN_TARGET_SIDE_PX
     ):
         return None
@@ -61,10 +58,10 @@ def _quiz_geometry(event: AlertEvent) -> dict[str, object] | None:
     image_width = max(1, round(crop_width * scale))
     image_height = max(1, round(crop_height * scale))
     target_bbox = [
-        (detection.x1 - crop_x1) * scale,
-        (detection.y1 - crop_y1) * scale,
-        (detection.x2 - crop_x1) * scale,
-        (detection.y2 - crop_y1) * scale,
+        (target_x1 - crop_x1) * scale,
+        (target_y1 - crop_y1) * scale,
+        (target_x2 - crop_x1) * scale,
+        (target_y2 - crop_y1) * scale,
     ]
     target_bbox = [
         max(0.0, min(float(image_width if index % 2 == 0 else image_height), value))
@@ -81,140 +78,226 @@ def _quiz_geometry(event: AlertEvent) -> dict[str, object] | None:
     }
 
 
-def generate_quiz_questions(db: Session, max_questions: int = 3) -> dict:
-    events = db.scalars(
-        select(AlertEvent)
-        .options(selectinload(AlertEvent.frame).selectinload(AlertFrame.detections))
-        .order_by(AlertEvent.created_at.desc(), AlertEvent.id.desc())
-    ).all()
-    rules = db.execute(
-        select(AlertRule.id, AlertRule.correct_reason).where(
-            AlertRule.correct_reason.is_not(None)
+def _candidate_query():
+    return (
+        select(
+            AlertEvent.id.label("event_id"),
+            AlertEvent.alert_frame_id.label("frame_id"),
+            AlertEvent.rule_id,
+            AlertEvent.hazard_reason_id,
+            AlertEvent.rule_name_snapshot,
+            AlertEvent.quiz_target_detection_id,
+            AlertEvent.quiz_correct_reason_snapshot,
+            AlertEvent.quiz_wrong_reason_snapshot,
+            AlertEvent.quiz_explanation_snapshot,
+            AlertEvent.crop_x1,
+            AlertEvent.crop_y1,
+            AlertEvent.crop_x2,
+            AlertEvent.crop_y2,
+            AlertEvent.created_at,
+            AlertFrame.width,
+            AlertFrame.height,
+            AlertFrameDetection.x1.label("target_x1"),
+            AlertFrameDetection.y1.label("target_y1"),
+            AlertFrameDetection.x2.label("target_x2"),
+            AlertFrameDetection.y2.label("target_y2"),
         )
-    ).all()
-    reason_by_rule = {
-        rule_id: reason.strip()
-        for rule_id, reason in rules
-        if reason and reason.strip()
+        .join(AlertFrame, AlertFrame.id == AlertEvent.alert_frame_id)
+        .join(
+            AlertFrameDetection,
+            AlertFrameDetection.id == AlertEvent.quiz_target_detection_id,
+        )
+        .where(
+            AlertFrameDetection.alert_frame_id == AlertEvent.alert_frame_id,
+            AlertEvent.hazard_reason_id.is_not(None),
+            AlertEvent.quiz_target_detection_id.is_not(None),
+            AlertEvent.quiz_correct_reason_snapshot.is_not(None),
+            AlertEvent.quiz_wrong_reason_snapshot.is_not(None),
+            AlertEvent.quiz_explanation_snapshot.is_not(None),
+            AlertEvent.crop_x1.is_not(None),
+            AlertEvent.crop_y1.is_not(None),
+            AlertEvent.crop_x2.is_not(None),
+            AlertEvent.crop_y2.is_not(None),
+        )
+        .order_by(AlertEvent.created_at.desc(), AlertEvent.id.desc())
+    )
+
+
+def _candidate_from_row(row) -> dict[str, object] | None:
+    geometry = _quiz_geometry(
+        width=row.width,
+        height=row.height,
+        crop_x1=row.crop_x1,
+        crop_y1=row.crop_y1,
+        crop_x2=row.crop_x2,
+        crop_y2=row.crop_y2,
+        target_x1=row.target_x1,
+        target_y1=row.target_y1,
+        target_x2=row.target_x2,
+        target_y2=row.target_y2,
+    )
+    correct_reason = (row.quiz_correct_reason_snapshot or "").strip()
+    wrong_reason = (row.quiz_wrong_reason_snapshot or "").strip()
+    explanation = (row.quiz_explanation_snapshot or "").strip()
+    if (
+        geometry is None
+        or not correct_reason
+        or not wrong_reason
+        or correct_reason.split() == wrong_reason.split()
+        or not explanation
+    ):
+        return None
+    return {
+        "event_id": row.event_id,
+        "frame_id": row.frame_id,
+        "rule_id": row.rule_id,
+        "hazard_reason_id": row.hazard_reason_id,
+        "correct_reason": correct_reason,
+        "wrong_reason": wrong_reason,
+        "explanation": explanation,
+        "geometry": geometry,
     }
 
-    events_with_education = [
-        event
-        for event in events
-        if event.quiz_correct_reason_snapshot
-        and event.quiz_explanation_snapshot
-    ]
-    events_with_snapshots = [
-        event
-        for event in events_with_education
-        if _quiz_geometry(event) is not None
-    ]
-    candidates = []
-    events_with_wrong_reason = 0
-    for event in events_with_snapshots:
-        correct_reason = event.quiz_correct_reason_snapshot.strip()
-        wrong_reasons = sorted(
-            {
-                reason
-                for rule_id, reason in reason_by_rule.items()
-                if rule_id != event.rule_id and reason != correct_reason
-            }
-        )
-        if not wrong_reasons:
-            continue
-        events_with_wrong_reason += 1
-        candidates.append(
-            {
-                "event": event,
-                "geometry": _quiz_geometry(event),
-                "wrong_reasons": wrong_reasons,
-            }
-        )
 
-    candidates_by_frame = {}
+def _select_candidates(
+    candidates: list[dict[str, object]],
+    max_questions: int,
+) -> list[dict[str, object]]:
+    selected = _select_distinct_candidates(candidates, max_questions)
+    if len(selected) >= max_questions:
+        return selected
+    selected_frames = {candidate["frame_id"] for candidate in selected}
+
+    candidates_by_reason: dict[int, list[dict[str, object]]] = {}
     for candidate in candidates:
-        candidates_by_frame.setdefault(
-            candidate["event"].alert_frame_id,
-            [],
-        ).append(candidate)
+        candidates_by_reason.setdefault(candidate["hazard_reason_id"], []).append(
+            candidate
+        )
 
-    selected = []
-    selected_frame_ids = set()
-    rule_frames = {}
-    for frame_id, frame_candidates in candidates_by_frame.items():
-        frame_rule_ids = set()
-        for candidate in frame_candidates:
-            event = candidate["event"]
-            rule_id = event.rule_id or f"snapshot:{event.rule_name_snapshot}"
-            if rule_id in frame_rule_ids:
+    reason_groups = sorted(
+        candidates_by_reason.values(),
+        key=lambda group: len({candidate["frame_id"] for candidate in group}),
+    )
+    selected_rules = {candidate["rule_id"] for candidate in selected}
+    for prefer_new_rule in (True, False):
+        for group in reason_groups:
+            for candidate in group:
+                frame_id = candidate["frame_id"]
+                if frame_id in selected_frames:
+                    continue
+                if prefer_new_rule and candidate["rule_id"] in selected_rules:
+                    continue
+                selected.append(candidate)
+                selected_frames.add(frame_id)
+                selected_rules.add(candidate["rule_id"])
+                if len(selected) >= max_questions:
+                    return selected
+    return selected
+
+
+def _select_distinct_candidates(
+    candidates: list[dict[str, object]],
+    max_questions: int,
+) -> list[dict[str, object]]:
+    candidates_by_reason: dict[int, list[dict[str, object]]] = {}
+    for candidate in candidates:
+        candidates_by_reason.setdefault(candidate["hazard_reason_id"], []).append(
+            candidate
+        )
+
+    reason_groups = sorted(
+        candidates_by_reason.items(),
+        key=lambda item: len(
+            {candidate["frame_id"] for candidate in item[1]}
+        ),
+    )
+    frame_reasons: dict[int, int] = {}
+    selected_by_reason: dict[int, dict[str, object]] = {}
+
+    def assign(
+        reason_id: int,
+        visited_frames: set[int],
+    ) -> bool:
+        for candidate in candidates_by_reason[reason_id]:
+            frame_id = candidate["frame_id"]
+            if frame_id in visited_frames:
                 continue
-            frame_rule_ids.add(rule_id)
-            rule_frames.setdefault(rule_id, []).append(frame_id)
+            visited_frames.add(frame_id)
+            assigned_reason = frame_reasons.get(frame_id)
+            if assigned_reason is None or assign(assigned_reason, visited_frames):
+                frame_reasons[frame_id] = reason_id
+                selected_by_reason[reason_id] = candidate
+                return True
+        return False
 
-    for rule_id in sorted(rule_frames, key=lambda item: len(rule_frames[item])):
-        for frame_id in rule_frames[rule_id]:
-            if frame_id in selected_frame_ids:
-                continue
-            candidate = next(
-                item
-                for item in candidates_by_frame[frame_id]
-                if (
-                    item["event"].rule_id
-                    or f"snapshot:{item['event'].rule_name_snapshot}"
-                )
-                == rule_id
-            )
-            selected.append(candidate)
-            selected_frame_ids.add(frame_id)
+    for reason_id, _ in reason_groups:
+        assign(reason_id, set())
+        if len(selected_by_reason) >= max_questions:
             break
-        if len(selected) >= max_questions:
+    return list(selected_by_reason.values())
+
+
+def _distinct_reason_count(
+    candidates: list[dict[str, object]],
+    max_questions: int,
+) -> int:
+    return len(_select_distinct_candidates(candidates, max_questions))
+
+
+def generate_quiz_questions(db: Session, max_questions: int = 3) -> dict:
+    candidates: list[dict[str, object]] = []
+    offset = 0
+    while offset < MAX_QUIZ_METADATA_ROWS:
+        rows = db.execute(
+            _candidate_query()
+            .offset(offset)
+            .limit(min(QUIZ_METADATA_PAGE_SIZE, MAX_QUIZ_METADATA_ROWS - offset))
+        ).all()
+        if not rows:
+            break
+        candidates.extend(
+            candidate
+            for row in rows
+            if (candidate := _candidate_from_row(row)) is not None
+        )
+        offset += len(rows)
+        if (
+            _distinct_reason_count(candidates, max_questions) >= max_questions
+            or len(rows) < QUIZ_METADATA_PAGE_SIZE
+        ):
             break
 
-    for frame_id, frame_candidates in candidates_by_frame.items():
-        if len(selected) >= max_questions:
-            break
-        if frame_id in selected_frame_ids:
-            continue
-        candidate = frame_candidates[0]
-        selected.append(candidate)
-        selected_frame_ids.add(frame_id)
-
+    selected = _select_candidates(candidates, max_questions)
     rng = random.SystemRandom()
     questions = []
     for candidate in selected:
-        event = candidate["event"]
         geometry = candidate["geometry"]
-        wrong_reason = rng.choice(candidate["wrong_reasons"])
         choices = [
-            {"id": "correct", "text": event.quiz_correct_reason_snapshot},
-            {"id": "incorrect", "text": wrong_reason},
+            {"id": "correct", "text": candidate["correct_reason"]},
+            {"id": "incorrect", "text": candidate["wrong_reason"]},
         ]
         rng.shuffle(choices)
         questions.append(
             {
-                "alert_event_id": event.id,
-                "image_url": f"/api/quiz/questions/{event.id}/image",
+                "alert_event_id": candidate["event_id"],
+                "hazard_reason_id": candidate["hazard_reason_id"],
+                "image_url": f"/api/quiz/questions/{candidate['event_id']}/image",
                 "image_width": geometry["image_width"],
                 "image_height": geometry["image_height"],
                 "target_bbox": geometry["target_bbox"],
                 "choices": choices,
                 "correct_choice_id": "correct",
-                "explanation": event.quiz_explanation_snapshot,
+                "explanation": candidate["explanation"],
             }
         )
 
     unavailable_reason = None
     if not questions:
-        if not events:
+        event_count = db.scalar(select(func.count()).select_from(AlertEvent)) or 0
+        if not event_count:
             unavailable_reason = "危険フレームがまだありません"
-        elif not events_with_education:
-            unavailable_reason = "教材設定がある発報履歴がまだありません"
-        elif not events_with_snapshots:
-            unavailable_reason = "出題できる大きさの教材画像がありません"
-        elif not events_with_wrong_reason:
-            unavailable_reason = "2択用の理由が不足しています"
         else:
-            unavailable_reason = "出題できる大きさの教材画像がありません"
+            unavailable_reason = "教材設定と保存画像がそろった発報履歴がありません"
 
     return {
         "questions": questions,
@@ -224,19 +307,49 @@ def generate_quiz_questions(db: Session, max_questions: int = 3) -> dict:
 
 
 def render_quiz_image(db: Session, alert_event_id: int) -> bytes:
-    event = db.scalar(
-        select(AlertEvent)
-        .options(selectinload(AlertEvent.frame).selectinload(AlertFrame.detections))
-        .where(AlertEvent.id == alert_event_id)
-    )
-    if event is None:
+    row = db.execute(
+        select(
+            AlertFrame.image_jpeg,
+            AlertFrame.width,
+            AlertFrame.height,
+            AlertEvent.crop_x1,
+            AlertEvent.crop_y1,
+            AlertEvent.crop_x2,
+            AlertEvent.crop_y2,
+            AlertFrameDetection.x1.label("target_x1"),
+            AlertFrameDetection.y1.label("target_y1"),
+            AlertFrameDetection.x2.label("target_x2"),
+            AlertFrameDetection.y2.label("target_y2"),
+        )
+        .join(AlertFrame, AlertFrame.id == AlertEvent.alert_frame_id)
+        .join(
+            AlertFrameDetection,
+            AlertFrameDetection.id == AlertEvent.quiz_target_detection_id,
+        )
+        .where(
+            AlertEvent.id == alert_event_id,
+            AlertFrameDetection.alert_frame_id == AlertEvent.alert_frame_id,
+        )
+    ).first()
+    if row is None:
         raise LookupError("教材イベントが見つかりません")
-    geometry = _quiz_geometry(event)
-    if geometry is None or event.frame is None:
+    geometry = _quiz_geometry(
+        width=row.width,
+        height=row.height,
+        crop_x1=row.crop_x1,
+        crop_y1=row.crop_y1,
+        crop_x2=row.crop_x2,
+        crop_y2=row.crop_y2,
+        target_x1=row.target_x1,
+        target_y1=row.target_y1,
+        target_x2=row.target_x2,
+        target_y2=row.target_y2,
+    )
+    if geometry is None or not row.image_jpeg:
         raise LookupError("教材画像または正解対象がありません")
 
     frame_image = cv2.imdecode(
-        np.frombuffer(event.frame.image_jpeg, dtype=np.uint8),
+        np.frombuffer(row.image_jpeg, dtype=np.uint8),
         cv2.IMREAD_COLOR,
     )
     if frame_image is None:

@@ -116,6 +116,9 @@ class ModelSettings(Base):
     active_model_id: Mapped[int | None] = mapped_column(
         ForeignKey("models.id", ondelete="SET NULL")
     )
+    requested_device: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="auto"
+    )
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.4)
     iou_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.7)
     imgsz: Mapped[int] = mapped_column(Integer, nullable=False, default=416)
@@ -156,6 +159,22 @@ class Insta360Settings(Base):
     )
 
 
+class HazardReason(Base):
+    __tablename__ = "hazard_reasons"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    correct_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    wrong_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    rules: Mapped[list[AlertRule]] = relationship(back_populates="hazard_reason")
+
+
 class AlertRule(Base):
     __tablename__ = "alert_rules"
 
@@ -166,8 +185,9 @@ class AlertRule(Base):
     release_duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=2000)
     cooldown_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
     education_target_class_name: Mapped[str | None] = mapped_column(String(255))
-    correct_reason: Mapped[str | None] = mapped_column(Text)
-    explanation: Mapped[str | None] = mapped_column(Text)
+    hazard_reason_id: Mapped[int | None] = mapped_column(
+        ForeignKey("hazard_reasons.id", ondelete="RESTRICT"), index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
@@ -176,6 +196,9 @@ class AlertRule(Base):
         back_populates="rule",
         cascade="all, delete-orphan",
         order_by="AlertRuleClass.id",
+    )
+    hazard_reason: Mapped[HazardReason | None] = relationship(
+        back_populates="rules"
     )
 
 
@@ -256,6 +279,7 @@ class AlertEvent(Base):
     model_id: Mapped[int | None] = mapped_column(
         ForeignKey("models.id", ondelete="SET NULL")
     )
+    hazard_reason_id: Mapped[int | None] = mapped_column(Integer)
     rule_name_snapshot: Mapped[str] = mapped_column(String(120), nullable=False)
     detected_classes_json: Mapped[str] = mapped_column(Text, nullable=False)
     matched_class_names_json: Mapped[str | None] = mapped_column(Text)
@@ -269,6 +293,7 @@ class AlertEvent(Base):
         ForeignKey("alert_frame_detections.id", ondelete="SET NULL")
     )
     quiz_correct_reason_snapshot: Mapped[str | None] = mapped_column(Text)
+    quiz_wrong_reason_snapshot: Mapped[str | None] = mapped_column(Text)
     quiz_explanation_snapshot: Mapped[str | None] = mapped_column(Text)
     crop_x1: Mapped[float | None] = mapped_column(Float)
     crop_y1: Mapped[float | None] = mapped_column(Float)
@@ -285,51 +310,62 @@ class AppSetting(Base):
     value_json: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class DatabaseSchemaError(RuntimeError):
+    pass
+
+
 def initialize_database() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(bind=engine)
 
     if engine.dialect.name == "sqlite":
-        migrations = {
-            "alert_rules": {
-                "education_target_class_name": "VARCHAR(255)",
-                "correct_reason": "TEXT",
-                "explanation": "TEXT",
-            },
+        inspector = inspect(engine)
+        existing_tables = set(inspector.get_table_names())
+        required_columns = {
+            "model_settings": {"requested_device"},
+            "alert_rules": {"hazard_reason_id"},
             "alert_events": {
-                "alert_frame_id": (
-                    "INTEGER REFERENCES alert_frames(id) ON DELETE SET NULL"
-                ),
-                "matched_class_names_json": "TEXT",
-                "quiz_target_detection_id": (
-                    "INTEGER REFERENCES alert_frame_detections(id) ON DELETE SET NULL"
-                ),
-                "quiz_correct_reason_snapshot": "TEXT",
-                "quiz_explanation_snapshot": "TEXT",
-                "crop_x1": "FLOAT",
-                "crop_y1": "FLOAT",
-                "crop_x2": "FLOAT",
-                "crop_y2": "FLOAT",
+                "hazard_reason_id",
+                "quiz_wrong_reason_snapshot",
             },
         }
-        with engine.begin() as connection:
-            for table_name, additions in migrations.items():
-                columns = {
+        app_tables = set(required_columns) | {"hazard_reasons"}
+        if existing_tables & app_tables:
+            missing_tables = app_tables - existing_tables
+            missing_columns = {
+                table_name: columns - {
                     column["name"]
-                    for column in inspect(engine).get_columns(table_name)
+                    for column in inspector.get_columns(table_name)
                 }
-                for column_name, column_definition in additions.items():
-                    if column_name not in columns:
-                        connection.exec_driver_sql(
-                            f"ALTER TABLE {table_name} ADD COLUMN "
-                            f"{column_name} {column_definition}"
-                        )
+                for table_name, columns in required_columns.items()
+                if table_name in existing_tables
+            }
+            missing_columns = {
+                table_name: columns
+                for table_name, columns in missing_columns.items()
+                if columns
+            }
+            if missing_tables or missing_columns:
+                details = []
+                if missing_tables:
+                    details.append(f"不足テーブル: {', '.join(sorted(missing_tables))}")
+                if missing_columns:
+                    details.extend(
+                        f"{table_name} の不足カラム: {', '.join(sorted(columns))}"
+                        for table_name, columns in sorted(missing_columns.items())
+                    )
+                raise DatabaseSchemaError(
+                        f"SQLite が旧スキーマです ({'; '.join(details)})."
+                    "データベースをバックアップしてから v0.7.0 用に明示的に"
+                    "初期化してください。モデル・動画ファイルは削除されません。"
+                )
+
+    Base.metadata.create_all(bind=engine)
 
     with SessionLocal.begin() as db:
         if db.get(ModelSettings, 1) is None:
-            db.add(ModelSettings(id=1))
+            db.add(ModelSettings(id=1, requested_device="auto"))
         if db.get(SourceSettings, 1) is None:
             legacy_camera = db.get(CameraSettings, 1)
             source_type = (

@@ -14,8 +14,10 @@ import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
 import EditOutlined from '@mui/icons-material/EditOutlined'
 import HistoryOutlined from '@mui/icons-material/HistoryOutlined'
 import Inventory2Outlined from '@mui/icons-material/Inventory2Outlined'
+import MemoryOutlined from '@mui/icons-material/MemoryOutlined'
 import PauseRounded from '@mui/icons-material/PauseRounded'
 import PlayArrowRounded from '@mui/icons-material/PlayArrowRounded'
+import ReportProblemOutlined from '@mui/icons-material/ReportProblemOutlined'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import SchoolOutlined from '@mui/icons-material/SchoolOutlined'
@@ -31,6 +33,7 @@ const navigation = [
   { id: 'dashboard', label: 'ダッシュボード', icon: <DashboardOutlined /> },
   { id: 'quiz', label: '問題に挑戦', icon: <SchoolOutlined /> },
   { id: 'models', label: 'モデル管理', icon: <Inventory2Outlined /> },
+  { id: 'hazard-reasons', label: '危険理由マスター', icon: <ReportProblemOutlined /> },
   { id: 'settings', label: '設定', icon: <SettingsOutlined /> },
   { id: 'alerts', label: 'アラート履歴', icon: <HistoryOutlined /> },
 ]
@@ -119,6 +122,7 @@ function CanvasView({ frame, settings, alerts, message }) {
   const containerRef = useRef(null)
   const canvasRef = useRef(null)
   const drawRef = useRef(() => {})
+  const drawSequenceRef = useRef(0)
 
   useEffect(() => {
     const container = containerRef.current
@@ -134,6 +138,7 @@ function CanvasView({ frame, settings, alerts, message }) {
 
   useEffect(() => {
     drawRef.current = () => {
+      const sequence = ++drawSequenceRef.current
       const canvas = canvasRef.current
       const container = containerRef.current
       if (!canvas || !container) return
@@ -150,6 +155,7 @@ function CanvasView({ frame, settings, alerts, message }) {
 
       const image = new Image()
       image.onload = () => {
+        if (sequence !== drawSequenceRef.current) return
         const scale = Math.min(bounds.width / frame.meta.width, bounds.height / frame.meta.height)
         const drawWidth = frame.meta.width * scale
         const drawHeight = frame.meta.height * scale
@@ -194,6 +200,9 @@ function CanvasView({ frame, settings, alerts, message }) {
       image.src = frame.url
     }
     drawRef.current()
+    return () => {
+      drawSequenceRef.current += 1
+    }
   }, [alerts, frame, settings])
 
   return (
@@ -217,7 +226,7 @@ function CanvasView({ frame, settings, alerts, message }) {
   )
 }
 
-function RuleEditor({ rule, classes, onSave, onCancel, saving }) {
+function RuleEditor({ rule, classes, hazardReasons, onSave, onCancel, saving }) {
   const [name, setName] = useState(rule?.name || '')
   const [selectedClasses, setSelectedClasses] = useState(rule?.class_names || [])
   const [detectionDuration, setDetectionDuration] = useState(rule?.detection_duration_ms ?? 500)
@@ -227,8 +236,9 @@ function RuleEditor({ rule, classes, onSave, onCancel, saving }) {
   const [educationTarget, setEducationTarget] = useState(
     rule?.education_target_class_name || '',
   )
-  const [correctReason, setCorrectReason] = useState(rule?.correct_reason || '')
-  const [explanation, setExplanation] = useState(rule?.explanation || '')
+  const [hazardReasonId, setHazardReasonId] = useState(
+    rule?.hazard_reason_id ? String(rule.hazard_reason_id) : '',
+  )
 
   const toggleClass = (className) => {
     const nextClasses = selectedClasses.includes(className)
@@ -248,10 +258,17 @@ function RuleEditor({ rule, classes, onSave, onCancel, saving }) {
       release_duration_ms: Number(releaseDuration),
       cooldown_ms: Number(cooldown),
       education_target_class_name: educationTarget || null,
-      correct_reason: correctReason.trim() || null,
-      explanation: explanation.trim() || null,
+      hazard_reason_id: educationTarget && hazardReasonId
+        ? Number(hazardReasonId)
+        : null,
     })
   }
+  const selectableHazardReasons = hazardReasons.filter(
+    (reason) => reason.enabled || reason.id === rule?.hazard_reason_id,
+  )
+  const selectedHazardReason = selectableHazardReasons.find(
+    (reason) => reason.id === Number(hazardReasonId),
+  )
 
   return (
     <form className="rule-editor" onSubmit={submit}>
@@ -297,7 +314,7 @@ function RuleEditor({ rule, classes, onSave, onCancel, saving }) {
         <div>
           <span className="control-label">教材設定（任意）</span>
           <p className="helper-text">
-            3項目を登録すると、発報時の画像から危険予知クイズを作成します。
+            正解対象クラスと危険理由マスターを選択すると教材を作成します。
           </p>
         </div>
         <MuiTextField
@@ -314,25 +331,30 @@ function RuleEditor({ rule, classes, onSave, onCancel, saving }) {
           ))}
         </MuiTextField>
         <MuiTextField
+          disabled={!educationTarget}
           fullWidth
-          label="危険な理由（2択の正解）"
-          maxRows={4}
-          minRows={2}
-          onChange={(event) => setCorrectReason(event.target.value)}
-          placeholder="例：手袋を着用したまま卓上ボール盤を使用しているため"
-          value={correctReason}
-          multiline
-        />
-        <MuiTextField
-          fullWidth
-          label="危険な理由の解説"
-          maxRows={5}
-          minRows={2}
-          onChange={(event) => setExplanation(event.target.value)}
-          placeholder="危険の内容と安全な行動を説明します"
-          value={explanation}
-          multiline
-        />
+          label="危険理由マスター"
+          onChange={(event) => setHazardReasonId(event.target.value)}
+          required={Boolean(educationTarget)}
+          select
+          value={hazardReasonId}
+        >
+          <MenuItem value="">選択してください</MenuItem>
+          {selectableHazardReasons.map((reason) => (
+            <MenuItem key={reason.id} value={String(reason.id)}>
+              {reason.name}{reason.enabled ? '' : '（無効）'}
+            </MenuItem>
+          ))}
+        </MuiTextField>
+        {selectedHazardReason && (
+          <div className="reason-preview-inline">
+            <span>正解: {selectedHazardReason.correct_reason}</span>
+            <span>誤答: {selectedHazardReason.wrong_reason}</span>
+          </div>
+        )}
+        {educationTarget && selectableHazardReasons.length === 0 && (
+          <p className="helper-text">有効な危険理由マスターがありません。先にマスターを登録してください。</p>
+        )}
       </div>
       <div className="duration-grid">
         <MuiTextField
@@ -369,10 +391,100 @@ function RuleEditor({ rule, classes, onSave, onCancel, saving }) {
         <AppButton className="button button-quiet" onClick={onCancel} type="button">キャンセル</AppButton>
         <AppButton
           className="button button-primary"
-          disabled={saving || selectedClasses.length < 2}
+          disabled={saving || selectedClasses.length < 2 || (educationTarget && !hazardReasonId)}
           type="submit"
         >
           {saving ? '保存中…' : 'ルールを保存'}
+        </AppButton>
+      </div>
+    </form>
+  )
+}
+
+function HazardReasonEditor({ reason, onSave, onCancel, saving }) {
+  const [name, setName] = useState(reason?.name || '')
+  const [correctReason, setCorrectReason] = useState(reason?.correct_reason || '')
+  const [wrongReason, setWrongReason] = useState(reason?.wrong_reason || '')
+  const [explanation, setExplanation] = useState(reason?.explanation || '')
+  const [enabled, setEnabled] = useState(reason?.enabled ?? true)
+
+  const submit = (event) => {
+    event.preventDefault()
+    onSave({
+      name,
+      correct_reason: correctReason,
+      wrong_reason: wrongReason,
+      explanation,
+      enabled,
+    })
+  }
+
+  return (
+    <form className="rule-editor hazard-reason-editor" onSubmit={submit}>
+      <div className="form-heading">
+        <div>
+          <span className="eyebrow">{reason ? 'HAZARD REASON EDITOR' : 'NEW HAZARD REASON'}</span>
+          <h3>{reason ? '危険理由を編集' : '危険理由マスターを追加'}</h3>
+        </div>
+        <AppIconButton className="icon-button" type="button" onClick={onCancel} aria-label="閉じる">×</AppIconButton>
+      </div>
+      <MuiTextField
+        fullWidth
+        label="名称"
+        onChange={(event) => setName(event.target.value)}
+        required
+        slotProps={{ htmlInput: { maxLength: 160 } }}
+        value={name}
+      />
+      <MuiTextField
+        fullWidth
+        label="正しい危険理由"
+        maxRows={4}
+        minRows={2}
+        onChange={(event) => setCorrectReason(event.target.value)}
+        required
+        slotProps={{ htmlInput: { maxLength: 2000 } }}
+        value={correctReason}
+        multiline
+      />
+      <MuiTextField
+        fullWidth
+        label="誤答として使用する理由"
+        maxRows={4}
+        minRows={2}
+        onChange={(event) => setWrongReason(event.target.value)}
+        required
+        slotProps={{ htmlInput: { maxLength: 2000 } }}
+        value={wrongReason}
+        multiline
+      />
+      <MuiTextField
+        fullWidth
+        label="正解後に表示する解説"
+        maxRows={5}
+        minRows={2}
+        onChange={(event) => setExplanation(event.target.value)}
+        required
+        slotProps={{ htmlInput: { maxLength: 4000 } }}
+        value={explanation}
+        multiline
+      />
+      <div className="reason-preview">
+        <span className="eyebrow">2択プレビュー</span>
+        <div className="reason-preview-choice"><strong>選択肢 A</strong><span>{correctReason || '正解理由を入力してください'}</span></div>
+        <div className="reason-preview-choice"><strong>選択肢 B</strong><span>{wrongReason || '誤答理由を入力してください'}</span></div>
+        <p>{explanation || '解説を入力してください'}</p>
+        <small>実際の問題では選択肢の表示順が出題時にランダム化されます。</small>
+      </div>
+      <FormControlLabel
+        className="rule-enabled-control"
+        control={<MuiSwitch checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />}
+        label="この危険理由を有効にする"
+      />
+      <div className="form-actions">
+        <AppButton className="button button-quiet" onClick={onCancel} type="button">キャンセル</AppButton>
+        <AppButton className="button button-primary" disabled={saving} type="submit">
+          {saving ? '保存中…' : '危険理由を保存'}
         </AppButton>
       </div>
     </form>
@@ -393,6 +505,7 @@ function App() {
   const [videos, setVideos] = useState([])
   const [playback, setPlayback] = useState(null)
   const [rules, setRules] = useState([])
+  const [hazardReasons, setHazardReasons] = useState([])
   const [history, setHistory] = useState([])
   const [alertDetail, setAlertDetail] = useState(null)
   const [alertDetailLoading, setAlertDetailLoading] = useState(false)
@@ -406,6 +519,8 @@ function App() {
   const [uploadMessage, setUploadMessage] = useState('')
   const [editingRule, setEditingRule] = useState(undefined)
   const [savingRule, setSavingRule] = useState(false)
+  const [editingHazardReason, setEditingHazardReason] = useState(undefined)
+  const [savingHazardReason, setSavingHazardReason] = useState(false)
   const [insta360Draft, setInsta360Draft] = useState(null)
   const [settingsDraft, setSettingsDraft] = useState(null)
   const [savingSettings, setSavingSettings] = useState(false)
@@ -415,11 +530,12 @@ function App() {
   const audioUnlockedRef = useRef(false)
   const settingsRef = useRef(null)
   const playSoundRef = useRef(() => {})
+  const testAlertTimeoutRef = useRef(null)
 
   const refreshData = useCallback(async () => {
     try {
       const [healthResult, sourceResult, insta360Result, settingsResult, modelsResult, activeModelResult,
-        videosResult, playbackResult, rulesResult, historyResult] = await Promise.all([
+        videosResult, playbackResult, rulesResult, hazardReasonsResult, historyResult] = await Promise.all([
         apiRequest('/health'),
         apiRequest('/source'),
         apiRequest('/insta360'),
@@ -429,6 +545,7 @@ function App() {
         apiRequest('/videos'),
         apiRequest('/videos/playback'),
         apiRequest('/rules'),
+        apiRequest('/hazard-reasons'),
         apiRequest('/alerts?limit=50&offset=0'),
       ])
       setHealth(healthResult)
@@ -441,6 +558,7 @@ function App() {
       setVideos(videosResult)
       setPlayback(playbackResult)
       setRules(rulesResult)
+      setHazardReasons(hazardReasonsResult)
       setHistory(historyResult.items || [])
       setSettingsDraft((current) => current || settingsResult)
       setInsta360Draft((current) => current || {
@@ -565,6 +683,13 @@ function App() {
           ...event,
           id: event.alert_id || (event.test ? 'test-alert' : `${event.rule_id}-${event.timestamp}`),
         }
+        if (event.test) {
+          window.clearTimeout(testAlertTimeoutRef.current)
+          testAlertTimeoutRef.current = window.setTimeout(() => {
+            setActiveAlerts((current) => current.filter((item) => item.id !== alert.id))
+            testAlertTimeoutRef.current = null
+          }, 4000)
+        }
         setActiveAlerts((current) => [
           ...current.filter((item) => item.id !== alert.id),
           alert,
@@ -577,6 +702,14 @@ function App() {
       } else if (event.type === 'model_changed') {
         clearCurrentFrame()
         setActiveAlerts([])
+        refreshData().catch(() => {})
+      } else if (event.type === 'device_changed' || event.type === 'device_fallback') {
+        clearCurrentFrame()
+        setActiveAlerts([])
+        setSettings((current) => current ? { ...current, ...event } : current)
+        setSettingsDraft((current) => current
+          ? { ...current, requested_device: event.requested_device || current.requested_device }
+          : current)
         refreshData().catch(() => {})
       } else if (event.type === 'rules_changed') {
         refreshData().catch(() => {})
@@ -611,6 +744,12 @@ function App() {
           meta: metadata,
           receivedAt: Date.now(),
         }
+        setSettings((current) => current ? {
+          ...current,
+          inference_fps: metadata.inference_fps,
+          processing_ms: metadata.processing_ms,
+          effective_device: metadata.effective_device || current.effective_device,
+        } : current)
         if (frameRef.current?.url) URL.revokeObjectURL(frameRef.current.url)
         frameRef.current = nextFrame
         setFrame(nextFrame)
@@ -677,6 +816,10 @@ function App() {
     return () => window.clearInterval(timer)
   }, [])
 
+  useEffect(() => () => {
+    window.clearTimeout(testAlertTimeoutRef.current)
+  }, [])
+
   useEffect(() => {
     if (camera?.source_type !== 'video') return undefined
     const timer = window.setInterval(() => {
@@ -691,8 +834,8 @@ function App() {
     && ['paused', 'ended', 'ready'].includes(playback?.status)
   const staleFrame = Boolean(frame && !videoPaused && clock - frame.receivedAt > 2500)
   const shownFrame = staleFrame ? null : frame
-  const detectionFps = frame?.meta.inference_fps || 0
-  const processingMs = frame?.meta.processing_ms
+  const detectionFps = frame?.meta.inference_fps ?? settings?.inference_fps ?? 0
+  const processingMs = frame?.meta.processing_ms ?? settings?.processing_ms
   const currentVideo = videos.find((video) => video.id === camera?.active_video_id)
   const latestAlert = activeAlerts.at(-1)
   const alertCount = history.length
@@ -816,6 +959,23 @@ function App() {
     }
   }
 
+  const saveHazardReason = async (payload) => {
+    setSavingHazardReason(true)
+    try {
+      const reasonId = editingHazardReason?.id
+      await apiRequest(reasonId ? `/hazard-reasons/${reasonId}` : '/hazard-reasons', {
+        method: reasonId ? 'PUT' : 'POST',
+        body: JSON.stringify(payload),
+      })
+      setEditingHazardReason(undefined)
+      await refreshData()
+    } catch (error) {
+      setApiError(error.message)
+    } finally {
+      setSavingHazardReason(false)
+    }
+  }
+
   const toggleRule = (rule) => handleAction(async () => {
     await apiRequest(`/rules/${rule.id}`, {
       method: 'PUT',
@@ -827,8 +987,7 @@ function App() {
         release_duration_ms: rule.release_duration_ms,
         cooldown_ms: rule.cooldown_ms,
         education_target_class_name: rule.education_target_class_name || null,
-        correct_reason: rule.correct_reason || null,
-        explanation: rule.explanation || null,
+        hazard_reason_id: rule.hazard_reason_id || null,
       }),
     })
     await refreshData()
@@ -846,6 +1005,29 @@ function App() {
     if (!window.confirm(`「${model.name}」を削除しますか？`)) return
     handleAction(async () => {
       await apiRequest(`/models/${model.id}`, { method: 'DELETE' })
+      await refreshData()
+    })
+  }
+
+  const toggleHazardReason = (reason) => handleAction(async () => {
+    await apiRequest(`/hazard-reasons/${reason.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        name: reason.name,
+        correct_reason: reason.correct_reason,
+        wrong_reason: reason.wrong_reason,
+        explanation: reason.explanation,
+        enabled: !reason.enabled,
+      }),
+    })
+    await refreshData()
+  })
+
+  const deleteHazardReason = (reason) => {
+    if (reason.reference_rule_count > 0) return
+    if (!window.confirm(`「${reason.name}」を削除しますか？`)) return
+    handleAction(async () => {
+      await apiRequest(`/hazard-reasons/${reason.id}`, { method: 'DELETE' })
       await refreshData()
     })
   }
@@ -905,11 +1087,12 @@ function App() {
     handleAction(async () => {
       setSavingSettings(true)
       try {
-        const { confidence, iou_threshold, imgsz, target_fps, jpeg_quality, show_boxes, show_labels,
+        const { requested_device, confidence, iou_threshold, imgsz, target_fps, jpeg_quality, show_boxes, show_labels,
           show_confidence, audio_enabled } = settingsDraft
         const result = await apiRequest('/settings', {
           method: 'PATCH',
           body: JSON.stringify({
+            requested_device,
             confidence,
             iou_threshold,
             imgsz,
@@ -923,6 +1106,9 @@ function App() {
         })
         setSettings(result)
         setSettingsDraft(result)
+      } catch (error) {
+        await refreshData().catch(() => {})
+        throw error
       } finally {
         setSavingSettings(false)
       }
@@ -975,12 +1161,12 @@ function App() {
       if (playback?.status === 'paused') return { title: '一時停止中', description: '最後に推論したフレームを表示しています' }
       if (playback?.status === 'ended') return { title: '再生終了', description: 'ループを有効にするか、先頭から再生してください' }
       if (playback?.status === 'error') return { title: '動画を再生できません', description: playback.error || '動画デコードに失敗しました' }
-      if (playback?.status === 'ready') return { title: '再生待機中', description: '再生ボタンを押すと CPU 推論を開始します' }
+      if (playback?.status === 'ready') return { title: '再生待機中', description: '再生ボタンを押すと推論を開始します' }
     } else {
       if (camera?.status === 'error') return { title: 'カメラに接続できません', description: camera.insta360_error || 'GO Ultra の Wi-Fi 接続と設定を確認してください' }
       if (camera?.status !== 'connected') return { title: 'カメラ未接続', description: '展示 PC を GO Ultra の Wi-Fi に接続し、接続を開始してください' }
     }
-    if (staleFrame) return { title: '推論フレームが届いていません', description: '入力ソースまたは CPU 推論の状態を確認してください' }
+    if (staleFrame) return { title: '推論フレームが届いていません', description: '入力ソースまたは推論デバイスの状態を確認してください' }
     return { title: '映像フレームを待っています', description: '最初の推論結果を受信するとここに表示します' }
   }, [
     activeModel,
@@ -1057,7 +1243,7 @@ function App() {
               <small>{socketStatus === 'connected' ? 'リアルタイム接続中' : '再接続を試行中'}</small>
             </div>
           </div>
-          <div className="sidebar-version">展示用システム <span>v0.6.0</span></div>
+          <div className="sidebar-version">展示用システム <span>v0.7.0</span></div>
         </div>
       </aside>
 
@@ -1122,7 +1308,13 @@ function App() {
                 </div>
                 <AppIconButton
                   className="icon-button"
-                  onClick={() => setActiveAlerts((current) => current.filter((item) => item.id !== alert.id))}
+                onClick={() => {
+                  if (alert.test) {
+                    window.clearTimeout(testAlertTimeoutRef.current)
+                    testAlertTimeoutRef.current = null
+                  }
+                  setActiveAlerts((current) => current.filter((item) => item.id !== alert.id))
+                }}
                   type="button"
                   aria-label="警告を閉じる"
                 >×</AppIconButton>
@@ -1145,7 +1337,9 @@ function App() {
                 <span className="metric-label">有効モデル</span>
                 <strong className="metric-truncate">{activeModel?.name || '未選択'}</strong>
                 <span className={`metric-status ${activeModel?.loaded ? 'is-good' : 'is-muted'}`}>
-                  <i />{activeModel?.loaded ? 'CPU 推論準備完了' : 'モデル待機中'}
+                  <i />{activeModel?.loaded
+                    ? `${settings?.effective_device || '推論'} 推論準備完了`
+                    : 'モデル待機中'}
                 </span>
               </div>
               <div className="metric-card">
@@ -1155,7 +1349,7 @@ function App() {
               </div>
               <div className="metric-card">
                 <span className="metric-label">処理時間</span>
-                <strong>{processingMs === undefined ? '--' : processingMs.toFixed(1)}<small> ms</small></strong>
+                <strong>{processingMs === undefined || processingMs === null ? '--' : processingMs.toFixed(1)}<small> ms</small></strong>
                 <span className="metric-caption">{frame ? `${frame.meta.width} × ${frame.meta.height}` : '推論フレーム待機中'}</span>
               </div>
             </section>
@@ -1335,6 +1529,7 @@ function App() {
                   {editingRule !== undefined && (
                     <RuleEditor
                       classes={activeModel?.classes || []}
+                      hazardReasons={hazardReasons}
                       key={editingRule?.id || 'new-rule'}
                       onCancel={() => setEditingRule(undefined)}
                       onSave={saveRule}
@@ -1346,7 +1541,9 @@ function App() {
                     {rules.length === 0 && editingRule === undefined && (
                       <div className="empty-list">まだルールがありません。2種類以上のクラスを組み合わせて追加してください。</div>
                     )}
-                    {rules.map((rule) => (
+                    {rules
+                      .filter((rule) => rule.id !== editingRule?.id)
+                      .map((rule) => (
                       <article className={`rule-item ${rule.incompatible ? 'is-incompatible' : ''}`} key={rule.id}>
                         <div className="rule-main">
                           <MuiSwitch
@@ -1486,8 +1683,145 @@ function App() {
           </div>
         )}
 
+        {page === 'hazard-reasons' && (
+          <div className="page-content narrow-page hazard-reasons-page">
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <span className="eyebrow">HAZARD REASON MASTER</span>
+                  <h2>危険理由マスター <span className="heading-count">{hazardReasons.length}</span></h2>
+                </div>
+                {editingHazardReason === undefined && (
+                  <AppButton
+                    className="button button-primary"
+                    onClick={() => setEditingHazardReason(null)}
+                    type="button"
+                  >＋ 新規登録</AppButton>
+                )}
+              </div>
+              <p className="section-description">
+                正解・誤答・解説を一組で管理し、複数のアラートルールから共有できます。
+                登録した内容は発報時に教材へスナップショット保存されます。
+              </p>
+              {editingHazardReason !== undefined && (
+                <HazardReasonEditor
+                  key={editingHazardReason?.id || 'new-hazard-reason'}
+                  onCancel={() => setEditingHazardReason(undefined)}
+                  onSave={saveHazardReason}
+                  reason={editingHazardReason}
+                  saving={savingHazardReason}
+                />
+              )}
+              {hazardReasons.length === 0 ? (
+                <div className="empty-state">
+                  <ReportProblemOutlined />
+                  <strong>危険理由マスターがありません</strong>
+                  <p>新規登録してから、アラートルールへ割り当ててください。</p>
+                </div>
+              ) : (
+                <div className="hazard-reason-list">
+                  {hazardReasons.map((reason) => (
+                    <article
+                      className={`hazard-reason-card ${reason.enabled ? '' : 'is-disabled'}`}
+                      key={reason.id}
+                    >
+                      <div className="hazard-reason-heading">
+                        <div>
+                          <h3>{reason.name}</h3>
+                          <span className="reference-count">
+                            {reason.reference_rule_count} 件のルールから参照中
+                          </span>
+                        </div>
+                        <div className="hazard-reason-actions">
+                          <FormControlLabel
+                            className="reason-enabled-control"
+                            control={(
+                              <MuiSwitch
+                                checked={reason.enabled}
+                                onChange={() => toggleHazardReason(reason)}
+                              />
+                            )}
+                            label={reason.enabled ? '有効' : '無効'}
+                          />
+                          <AppButton
+                            className="text-button"
+                            onClick={() => setEditingHazardReason(reason)}
+                            startIcon={<EditOutlined />}
+                            type="button"
+                          >編集</AppButton>
+                          <AppButton
+                            className="text-button danger-text"
+                            disabled={reason.reference_rule_count > 0}
+                            onClick={() => deleteHazardReason(reason)}
+                            startIcon={<DeleteOutlineRounded />}
+                            type="button"
+                          >削除</AppButton>
+                        </div>
+                      </div>
+                      <div className="reason-preview-pair">
+                        <div><strong>正解理由</strong><span>{reason.correct_reason}</span></div>
+                        <div><strong>誤答</strong><span>{reason.wrong_reason}</span></div>
+                      </div>
+                      <p className="hazard-reason-explanation">{reason.explanation}</p>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+
         {page === 'settings' && (
           <div className="page-content narrow-page settings-page">
+            <section className="panel inference-device-panel">
+              <div className="section-title">
+                <div className="section-icon"><MemoryOutlined /></div>
+                <div><span className="eyebrow">INFERENCE DEVICE</span><h2>GPU / CPU 推論デバイス</h2></div>
+              </div>
+              <div className="settings-grid device-setting-grid">
+                <MuiTextField
+                  fullWidth
+                  helperText="Auto は CUDA を優先し、利用できない場合は CPU を使います。"
+                  label="要求する推論モード"
+                  onChange={(event) => changeSetting('requested_device', event.target.value)}
+                  select
+                  value={settingsDraft?.requested_device || 'auto'}
+                >
+                  <MenuItem value="auto">Auto（CUDA優先・CPUフォールバック）</MenuItem>
+                  <MenuItem value="cuda">NVIDIA GPU（CUDA固定）</MenuItem>
+                  <MenuItem value="cpu">CPU固定</MenuItem>
+                </MuiTextField>
+                <div className="device-status-grid">
+                  <div><span>要求設定</span><strong>{settings?.requested_device || 'auto'}</strong></div>
+                  <div><span>実効デバイス</span><strong>{settings?.effective_device || 'none'}</strong></div>
+                  <div><span>CUDA 利用可否</span><strong>{settings?.cuda_available ? '利用可能' : '利用不可'}</strong></div>
+                  <div><span>NVIDIA GPU</span><strong>{settings?.gpu_name || '検出されていません'}</strong></div>
+                  <div><span>推論 FPS</span><strong>{Number(settings?.inference_fps || 0).toFixed(1)} FPS</strong></div>
+                  <div><span>推論処理時間</span><strong>{settings?.processing_ms == null ? '—' : `${Number(settings.processing_ms).toFixed(1)} ms`}</strong></div>
+                </div>
+              </div>
+              {settings?.fallback_reason && (
+                <div className="notice notice-warning device-notice">
+                  <span>!</span>
+                  <p>
+                    {settings.effective_device === 'cpu'
+                      ? 'CPU フォールバック中: '
+                      : 'CUDAを利用できないためAutoはCPUを選択します: '}
+                    {settings.fallback_reason}
+                  </p>
+                </div>
+              )}
+              {settings?.device_error && (
+                <div className="notice notice-error device-notice">
+                  <span>!</span><p>{settings.device_error}</p>
+                </div>
+              )}
+              <p className="helper-text">デバイスモードは下の「設定を保存」を押すと適用されます。切替時は推論を一時停止してモデルを再ロードします。</p>
+              {!settings?.cuda_available && settings?.cuda_error && (
+                <p className="helper-text">{settings.cuda_error}</p>
+              )}
+            </section>
+
             <section className="panel">
               <div className="section-title">
                 <div className="section-icon">⌁</div>
@@ -1531,10 +1865,10 @@ function App() {
 
             <section className="panel">
               <div className="section-title">
-                <div className="section-icon">⌘</div>
-                <div><span className="eyebrow">CPU INFERENCE</span><h2>推論設定</h2></div>
+                <div className="section-icon"><MemoryOutlined /></div>
+                <div><span className="eyebrow">MODEL INFERENCE</span><h2>推論・表示設定</h2></div>
               </div>
-              <form className="settings-form" onSubmit={saveSettings}>
+              <form className="settings-form" id="inference-settings-form" onSubmit={saveSettings}>
                 <div className="settings-grid">
                   <MuiTextField
                     fullWidth
@@ -1628,7 +1962,10 @@ function App() {
             <section className="panel runtime-panel">
               <div><span className="eyebrow">RUNTIME</span><h2>実行環境</h2></div>
               <div className="runtime-grid">
-                <span>推論デバイス</span><strong>CPU</strong>
+                <span>推論デバイス</span><strong>{settings?.effective_device || 'none'}</strong>
+                <span>要求モード</span><strong>{settings?.requested_device || 'auto'}</strong>
+                <span>CUDA</span><strong>{settings?.cuda_available ? '利用可能' : '利用不可'}</strong>
+                <span>GPU</span><strong>{settings?.gpu_name || '検出されていません'}</strong>
                 <span>Backend 稼働時間</span><strong>{health ? `${Math.floor(health.uptime_seconds / 60)} 分` : '不明'}</strong>
                 <span>MP4 アップロード上限</span><strong>{formatBytes(settings?.max_video_size_bytes)}</strong>
                 <span>.pt アップロード上限</span><strong>{formatBytes(settings?.max_model_size_bytes)}</strong>
