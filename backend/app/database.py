@@ -165,6 +165,9 @@ class AlertRule(Base):
     detection_duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=500)
     release_duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=2000)
     cooldown_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
+    education_target_class_name: Mapped[str | None] = mapped_column(String(255))
+    correct_reason: Mapped[str | None] = mapped_column(Text)
+    explanation: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
@@ -262,6 +265,15 @@ class AlertEvent(Base):
         ForeignKey("videos.id", ondelete="SET NULL")
     )
     media_time_ms: Mapped[int | None] = mapped_column(Integer)
+    quiz_target_detection_id: Mapped[int | None] = mapped_column(
+        ForeignKey("alert_frame_detections.id", ondelete="SET NULL")
+    )
+    quiz_correct_reason_snapshot: Mapped[str | None] = mapped_column(Text)
+    quiz_explanation_snapshot: Mapped[str | None] = mapped_column(Text)
+    crop_x1: Mapped[float | None] = mapped_column(Float)
+    crop_y1: Mapped[float | None] = mapped_column(Float)
+    crop_x2: Mapped[float | None] = mapped_column(Float)
+    crop_y2: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     frame: Mapped[AlertFrame | None] = relationship(back_populates="events")
 
@@ -280,19 +292,40 @@ def initialize_database() -> None:
     Base.metadata.create_all(bind=engine)
 
     if engine.dialect.name == "sqlite":
-        columns = {
-            column["name"] for column in inspect(engine).get_columns("alert_events")
+        migrations = {
+            "alert_rules": {
+                "education_target_class_name": "VARCHAR(255)",
+                "correct_reason": "TEXT",
+                "explanation": "TEXT",
+            },
+            "alert_events": {
+                "alert_frame_id": (
+                    "INTEGER REFERENCES alert_frames(id) ON DELETE SET NULL"
+                ),
+                "matched_class_names_json": "TEXT",
+                "quiz_target_detection_id": (
+                    "INTEGER REFERENCES alert_frame_detections(id) ON DELETE SET NULL"
+                ),
+                "quiz_correct_reason_snapshot": "TEXT",
+                "quiz_explanation_snapshot": "TEXT",
+                "crop_x1": "FLOAT",
+                "crop_y1": "FLOAT",
+                "crop_x2": "FLOAT",
+                "crop_y2": "FLOAT",
+            },
         }
         with engine.begin() as connection:
-            if "alert_frame_id" not in columns:
-                connection.exec_driver_sql(
-                    "ALTER TABLE alert_events ADD COLUMN "
-                    "alert_frame_id INTEGER REFERENCES alert_frames(id) ON DELETE SET NULL"
-                )
-            if "matched_class_names_json" not in columns:
-                connection.exec_driver_sql(
-                    "ALTER TABLE alert_events ADD COLUMN matched_class_names_json TEXT"
-                )
+            for table_name, additions in migrations.items():
+                columns = {
+                    column["name"]
+                    for column in inspect(engine).get_columns(table_name)
+                }
+                for column_name, column_definition in additions.items():
+                    if column_name not in columns:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {table_name} ADD COLUMN "
+                            f"{column_name} {column_definition}"
+                        )
 
     with SessionLocal.begin() as db:
         if db.get(ModelSettings, 1) is None:

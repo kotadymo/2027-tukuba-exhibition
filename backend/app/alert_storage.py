@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .database import AlertEvent, AlertFrame, AlertFrameDetection, utc_now
+from .database import (
+    AlertEvent,
+    AlertFrame,
+    AlertFrameDetection,
+    utc_now,
+)
 from .inference import Detection
 
 
@@ -34,7 +40,8 @@ def persist_alert_frame_events(
             AlertFrame.frame_id == frame_id,
         )
     ).first()
-    if frame is None:
+    created_frame = frame is None
+    if created_frame:
         frame_time = datetime.fromisoformat(timestamp).astimezone(timezone.utc)
         frame = AlertFrame(
             source_session_id=source_session_id,
@@ -64,9 +71,24 @@ def persist_alert_frame_events(
         db.add(frame)
         db.flush()
 
+    if created_frame:
+        frame_detections = list(frame.detections)
+    else:
+        frame_detections = db.scalars(
+            select(AlertFrameDetection).where(
+                AlertFrameDetection.alert_frame_id == frame.id
+            )
+        ).all()
+
     persisted_events = []
     for event in events:
         matched_classes = event["detected_classes"]
+        education_snapshot = _education_snapshot(
+            event,
+            frame_detections,
+            width,
+            height,
+        )
         record = AlertEvent(
             alert_frame_id=frame.id,
             rule_id=event["rule_id"],
@@ -78,6 +100,13 @@ def persist_alert_frame_events(
             source_type=source_type,
             video_id=video_id,
             media_time_ms=media_time_ms,
+            quiz_target_detection_id=education_snapshot.get("target_detection_id"),
+            quiz_correct_reason_snapshot=education_snapshot.get("correct_reason"),
+            quiz_explanation_snapshot=education_snapshot.get("explanation"),
+            crop_x1=education_snapshot.get("crop_x1"),
+            crop_y1=education_snapshot.get("crop_y1"),
+            crop_x2=education_snapshot.get("crop_x2"),
+            crop_y2=education_snapshot.get("crop_y2"),
             created_at=utc_now(),
         )
         db.add(record)
@@ -91,3 +120,69 @@ def persist_alert_frame_events(
             }
         )
     return persisted_events
+
+
+def _education_snapshot(
+    event: dict[str, Any],
+    detections: list[AlertFrameDetection],
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    target_class_name = event.get("education_target_class_name")
+    correct_reason = event.get("correct_reason")
+    explanation = event.get("explanation")
+    required_classes = set(event.get("detected_classes") or [])
+    if (
+        not target_class_name
+        or target_class_name not in required_classes
+        or not correct_reason
+        or not explanation
+    ):
+        return {}
+
+    best_by_class: dict[str, AlertFrameDetection] = {}
+    for detection in detections:
+        if detection.class_name not in required_classes:
+            continue
+        current = best_by_class.get(detection.class_name)
+        if current is None or detection.confidence > current.confidence:
+            best_by_class[detection.class_name] = detection
+    if required_classes - best_by_class.keys():
+        return {}
+
+    target = best_by_class.get(target_class_name)
+    if target is None:
+        return {}
+    x1 = min(detection.x1 for detection in best_by_class.values())
+    y1 = min(detection.y1 for detection in best_by_class.values())
+    x2 = max(detection.x2 for detection in best_by_class.values())
+    y2 = max(detection.y2 for detection in best_by_class.values())
+    union_width = x2 - x1
+    union_height = y2 - y1
+    if (
+        not all(math.isfinite(value) for value in (x1, y1, x2, y2))
+        or union_width <= 0
+        or union_height <= 0
+        or width <= 0
+        or height <= 0
+    ):
+        return {}
+
+    margin_x = max(union_width * 0.25, 16)
+    margin_y = max(union_height * 0.25, 16)
+    crop_x1 = max(0, math.floor(x1 - margin_x))
+    crop_y1 = max(0, math.floor(y1 - margin_y))
+    crop_x2 = min(width, math.ceil(x2 + margin_x))
+    crop_y2 = min(height, math.ceil(y2 + margin_y))
+    if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+        return {}
+
+    return {
+        "target_detection_id": target.id,
+        "correct_reason": correct_reason,
+        "explanation": explanation,
+        "crop_x1": crop_x1,
+        "crop_y1": crop_y1,
+        "crop_x2": crop_x2,
+        "crop_y2": crop_y2,
+    }

@@ -1,5 +1,5 @@
 :root {
-  font-family: 'DM Sans', 'Noto Sans JP', sans-serif;
+  font-family: 'Roboto', 'Noto Sans JP', 'Yu Gothic UI', sans-serif;
   color: #e8edf2;
   background: #0c1116;
   font-synthesis: none;
@@ -134,6 +134,7 @@ button:disabled {
 
 .nav-item {
   display: flex;
+  width: 100%;
   min-height: 42px;
   align-items: center;
   gap: 12px;
@@ -145,6 +146,7 @@ button:disabled {
   cursor: pointer;
   font-size: 12px;
   text-align: left;
+  justify-content: flex-start;
   transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
 }
 
@@ -632,7 +634,7 @@ button:disabled {
 
 .button {
   display: inline-flex;
-  min-height: 34px;
+  min-height: 48px;
   align-items: center;
   justify-content: center;
   gap: 7px;
@@ -643,6 +645,39 @@ button:disabled {
   font-size: 10px;
   font-weight: 600;
   transition: filter 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+
+.education-rule-fields {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.education-rule-fields .helper-text {
+  margin: 6px 0 0;
+  font-size: 12px;
+}
+
+.education-rule-fields .MuiFormControl-root {
+  min-width: 0;
+}
+
+.duration-grid > .MuiFormControl-root,
+.settings-grid > .MuiFormControl-root {
+  min-width: 0;
+  width: 100%;
+}
+
+.toggle-row .MuiSwitch-input {
+  width: 100%;
+  height: 100%;
+}
+
+.rule-enabled-control {
+  margin-left: 0 !important;
 }
 
 .button:hover:not(:disabled) {
@@ -1944,7 +1979,7 @@ td:first-child {
 
   .side-nav {
     width: 100%;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     gap: 4px;
   }
 
@@ -2179,5 +2214,244 @@ td:first-child {
 
   .alert-stack {
     margin-top: 8px;
+  }
+}
+
+.nav-icon svg {
+  display: block;
+  width: 22px;
+  height: 22px;
+}
+
+.quiz-page {
+  width: min(100%, 1680px);
+  margin: 0 auto;
+  padding: clamp(16px, 2vw, 36px) 0;
+}
+
+.quiz-card,
+.quiz-complete-card {
+  border: 1px solid var(--border-soft);
+  background: var(--panel) !important;
+}
+
+.quiz-image-viewport {
+  display: flex;
+  width: 100%;
+  max-height: 72vh;
+  min-height: 320px;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: #080d12;
+  touch-action: pan-x pan-y;
+}
+
+.quiz-image-frame {
+  position: relative;
+  flex: 0 0 auto;
+  transition: transform 160ms ease;
+}
+
+.quiz-image,
+.quiz-image.is-tappable {
+  cursor: crosshair;
+}
+
+.quiz-target-overlay {
+  animation: quiz-target-appear 220ms ease-out both;
+}
+
+.quiz-complete-card {
+  max-width: 1100px;
+  margin: 8vh auto;
+}
+
+.education-rule-fields .MuiInputLabel-root,
+.education-rule-fields .MuiInputBase-root,
+.quiz-page .MuiTypography-root {
+  font-family: 'Roboto', 'Noto Sans JP', 'Yu Gothic UI', sans-serif;
+}
+
+@keyframes quiz-target-appear {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (min-width: 1600px) {
+  .quiz-page {
+    padding-top: 40px;
+  }
+
+  .quiz-card .MuiCardContent-root {
+    padding: 36px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .quiz-image-frame,
+  .quiz-target-overlay {
+    animation: none;
+    transition: none;
+  }
+}
+
+@media (min-width: 1600px) {
+  .sidebar {
+    width: 280px;
+    padding: 32px 20px 24px;
+  }
+
+  .brand {
+    gap: 16px;
+    padding-bottom: 42px;
+  }
+
+  .brand strong {
+    font-size: 16px;
+  }
+
+  .brand small {
+    font-size: 10px;
+  }
+
+  .side-section-label,
+  .eyebrow {
+    font-size: 11px;
+  }
+
+  .nav-item {
+    min-height: 56px;
+    gap: 14px;
+    padding-inline: 16px;
+    border-radius: 28px;
+    font-size: 15px;
+  }
+
+  .nav-icon {
+    width: 24px;
+  }
+
+  .nav-icon svg {
+    width: 24px;
+    height: 24px;
+  }
+
+  .main-area {
+    margin-left: 280px;
+    padding-right: 48px;
+    padding-left: 48px;
+  }
+
+  .topbar {
+    min-height: 112px;
+  }
+
+  .topbar h1 {
+    font-size: 28px;
+  }
+
+  .page-content {
+    padding-top: 24px;
+  }
+
+  .metrics-grid {
+    gap: 16px;
+    margin-bottom: 18px;
+  }
+
+  .metric-card {
+    min-height: 122px;
+    gap: 10px;
+    padding: 20px;
+    border-radius: 20px;
+  }
+
+  .metric-label,
+  .metric-status,
+  .metric-caption {
+    font-size: 13px;
+  }
+
+  .metric-card > strong {
+    font-size: 27px;
+  }
+
+  .metric-card .metric-truncate {
+    font-size: 22px;
+  }
+
+  .panel {
+    border-radius: 24px;
+  }
+
+  .panel-heading {
+    min-height: 82px;
+    padding: 18px 22px;
+  }
+
+  .panel-heading h2 {
+    font-size: 20px;
+  }
+
+  .panel-heading .eyebrow {
+    font-size: 10px;
+  }
+
+  .video-stage {
+    min-height: 520px;
+  }
+
+  .frame-footer,
+  .control-label,
+  .source-url,
+  .helper-text,
+  .inline-message,
+  .field {
+    font-size: 14px;
+  }
+
+  .button,
+  .text-button {
+    font-size: 14px;
+  }
+
+  .field input,
+  .field select {
+    min-height: 48px;
+    font-size: 15px;
+  }
+
+  .class-tags span {
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+
+  .rule-item {
+    padding: 18px;
+  }
+
+  .rule-info > strong,
+  .recent-row strong {
+    font-size: 15px;
+  }
+
+  .rule-foot,
+  .recent-row small,
+  .recent-row time {
+    font-size: 12px;
+  }
+
+  th,
+  td {
+    padding: 16px 14px;
+    font-size: 13px;
+  }
+
+  .page-footer {
+    font-size: 11px;
   }
 }

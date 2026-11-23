@@ -46,7 +46,7 @@ class AlertStorageTests(unittest.TestCase):
             },
         ]
 
-    def _persist(self, db, events=None):
+    def _persist(self, db, events=None, detections=None):
         return persist_alert_frame_events(
             db,
             events=self._events() if events is None else events,
@@ -61,7 +61,9 @@ class AlertStorageTests(unittest.TestCase):
             width=640,
             height=360,
             image_jpeg=b"\xff\xd8jpeg-frame\xff\xd9",
-            detections=[
+            detections=detections
+            if detections is not None
+            else [
                 Detection(0, "hand", 0.94, [10, 20, 100, 120]),
                 Detection(1, "tool", 0.87, [120, 40, 300, 240]),
                 Detection(2, "background-object", 0.52, [5, 6, 8, 9]),
@@ -126,6 +128,49 @@ class AlertStorageTests(unittest.TestCase):
                 db.scalar(select(func.count()).select_from(AlertFrameDetection)),
                 0,
             )
+
+    def test_education_snapshot_selects_target_and_crops_all_rule_classes(self):
+        event = self._events()[0]
+        event.update(
+            education_target_class_name="hand",
+            correct_reason="手が工具に近づいているため",
+            explanation="工具の可動部に巻き込まれる危険があります。",
+        )
+        with Session(self.engine) as db:
+            with db.begin():
+                self._persist(
+                    db,
+                    [event],
+                    [
+                        Detection(0, "hand", 0.94, [10, 20, 100, 120]),
+                        Detection(0, "hand", 0.99, [50, 60, 90, 110]),
+                        Detection(1, "tool", 0.87, [120, 40, 300, 240]),
+                        Detection(2, "background-object", 0.52, [5, 6, 8, 9]),
+                    ],
+                )
+
+            saved = db.scalar(select(AlertEvent))
+            self.assertIsNotNone(saved.quiz_target_detection_id)
+            self.assertEqual(
+                saved.quiz_correct_reason_snapshot,
+                "手が工具に近づいているため",
+            )
+            self.assertEqual(
+                saved.quiz_explanation_snapshot,
+                "工具の可動部に巻き込まれる危険があります。",
+            )
+            self.assertEqual(
+                (
+                    saved.crop_x1,
+                    saved.crop_y1,
+                    saved.crop_x2,
+                    saved.crop_y2,
+                ),
+                (0, 0, 363, 290),
+            )
+            target = db.get(AlertFrameDetection, saved.quiz_target_detection_id)
+            self.assertEqual(target.class_name, "hand")
+            self.assertEqual(target.confidence, 0.99)
 
 
 class AlertApiTests(unittest.TestCase):

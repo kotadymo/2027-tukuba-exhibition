@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class SourcePatch(BaseModel):
@@ -44,6 +44,9 @@ class RulePayload(BaseModel):
     detection_duration_ms: int = Field(default=500, ge=0, le=600_000)
     release_duration_ms: int = Field(default=2000, ge=0, le=600_000)
     cooldown_ms: int = Field(default=10_000, ge=0, le=3_600_000)
+    education_target_class_name: str | None = Field(default=None, max_length=255)
+    correct_reason: str | None = Field(default=None, max_length=2000)
+    explanation: str | None = Field(default=None, max_length=4000)
 
     @field_validator("name")
     @classmethod
@@ -64,6 +67,30 @@ class RulePayload(BaseModel):
         if len(normalized) < 2:
             raise ValueError("ルールには異なるクラスを2種類以上選択してください")
         return normalized
+
+    @field_validator(
+        "education_target_class_name",
+        "correct_reason",
+        "explanation",
+    )
+    @classmethod
+    def normalize_education_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @model_validator(mode="after")
+    def validate_education_target(self):
+        if (
+            self.education_target_class_name is not None
+            and self.education_target_class_name not in self.class_names
+        ):
+            raise ValueError("教材の正解対象クラスはルール対象クラスから選択してください")
+        return self
+
+
+class QuizGeneratePayload(BaseModel):
+    max_questions: int = Field(default=3, ge=1, le=3)
 
 
 class SettingsPatch(BaseModel):

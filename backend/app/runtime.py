@@ -161,6 +161,11 @@ class RuleEngine:
                                 "video_id": video_id,
                                 "media_time_ms": media_time_ms,
                                 "model_id": model_id,
+                                "education_target_class_name": rule.get(
+                                    "education_target_class_name"
+                                ),
+                                "correct_reason": rule.get("correct_reason"),
+                                "explanation": rule.get("explanation"),
                                 "test": False,
                             }
                         )
@@ -1206,6 +1211,9 @@ class LiveRuntime:
                         "detection_duration_ms": rule.detection_duration_ms,
                         "release_duration_ms": rule.release_duration_ms,
                         "cooldown_ms": rule.cooldown_ms,
+                        "education_target_class_name": rule.education_target_class_name,
+                        "correct_reason": rule.correct_reason,
+                        "explanation": rule.explanation,
                     }
                     for rule in rule_records
                 ]

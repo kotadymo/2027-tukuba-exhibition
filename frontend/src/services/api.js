@@ -27,6 +27,9 @@ export async function apiRequest(path, options = {}) {
 }
 
 export function apiResourceUrl(path) {
+  if (path.startsWith('/api/')) {
+    return `${apiBase}${path}`
+  }
   return `${apiBase}/api${path}`
 }
 
