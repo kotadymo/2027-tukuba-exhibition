@@ -18,6 +18,7 @@ from sqlalchemy import (
     create_engine,
     event,
     inspect,
+    update,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -266,10 +267,62 @@ class AlertFrameDetection(Base):
     frame: Mapped[AlertFrame] = relationship(back_populates="detections")
 
 
+class BatchJob(Base):
+    __tablename__ = "batch_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    model_id: Mapped[int | None] = mapped_column(
+        ForeignKey("models.id", ondelete="SET NULL")
+    )
+    model_name_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
+    settings_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    total_videos: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_videos: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    processed_frames: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_alerts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    videos: Mapped[list[BatchJobVideo]] = relationship(
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="BatchJobVideo.order_index",
+    )
+
+
+class BatchJobVideo(Base):
+    __tablename__ = "batch_job_videos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_job_id: Mapped[int] = mapped_column(
+        ForeignKey("batch_jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    video_id: Mapped[int | None] = mapped_column(
+        ForeignKey("videos.id", ondelete="SET NULL")
+    )
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    video_name_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
+    video_stored_filename_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
+    fps_snapshot: Mapped[float | None] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    processed_frames: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_frames: Mapped[int | None] = mapped_column(Integer)
+    alert_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    job: Mapped[BatchJob] = relationship(back_populates="videos")
+
+
 class AlertEvent(Base):
     __tablename__ = "alert_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("batch_jobs.id", ondelete="SET NULL"), index=True
+    )
     alert_frame_id: Mapped[int | None] = mapped_column(
         ForeignKey("alert_frames.id", ondelete="SET NULL"), index=True
     )
@@ -363,6 +416,21 @@ def initialize_database() -> None:
 
     Base.metadata.create_all(bind=engine)
 
+    if engine.dialect.name == "sqlite":
+        alert_event_columns = {
+            column["name"] for column in inspect(engine).get_columns("alert_events")
+        }
+        if "batch_job_id" not in alert_event_columns:
+            with engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "ALTER TABLE alert_events ADD COLUMN "
+                    "batch_job_id INTEGER REFERENCES batch_jobs(id) ON DELETE SET NULL"
+                )
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_alert_events_batch_job_id "
+                    "ON alert_events (batch_job_id)"
+                )
+
     with SessionLocal.begin() as db:
         if db.get(ModelSettings, 1) is None:
             db.add(ModelSettings(id=1, requested_device="auto"))
@@ -389,3 +457,19 @@ def initialize_database() -> None:
             )
         if db.get(Insta360Settings, 1) is None:
             db.add(Insta360Settings(id=1))
+        now = utc_now()
+        interrupted_message = "Backend の再起動によりジョブが中断されました。自動再開はされません。"
+        db.execute(
+            update(BatchJob)
+            .where(BatchJob.status.in_(("pending", "running")))
+            .values(
+                status="interrupted",
+                finished_at=now,
+                error_message=interrupted_message,
+            )
+        )
+        db.execute(
+            update(BatchJobVideo)
+            .where(BatchJobVideo.status.in_(("pending", "running")))
+            .values(status="interrupted", error_message=interrupted_message)
+        )

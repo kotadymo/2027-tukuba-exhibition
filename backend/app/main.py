@@ -29,8 +29,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, exists, func, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, defer, selectinload
 
+from .batch_jobs import (
+    BatchJobConflict,
+    BatchJobManager,
+    serialize_batch_job,
+)
 from .database import (
     AlertEvent,
     AlertFrame,
@@ -38,6 +43,7 @@ from .database import (
     AlertRule,
     AlertRuleClass,
     AppSetting,
+    BatchJob,
     HazardReason,
     Insta360Settings,
     MAX_MODEL_SIZE_BYTES,
@@ -56,6 +62,7 @@ from .education import generate_quiz_questions, render_quiz_image
 from .inference import CUDAUnavailableError, Detector, ModelValidationError
 from .runtime import LiveRuntime, WebSocketHub
 from .schemas import (
+    BatchJobCreatePayload,
     Insta360SettingsPatch,
     LoopPatch,
     PlaybackAction,
@@ -84,6 +91,19 @@ def _get_db():
         yield db
     finally:
         db.close()
+
+
+@asynccontextmanager
+async def _batch_operation(request: Request):
+    manager: BatchJobManager | None = getattr(request.app.state, "batch_jobs", None)
+    if manager is None:
+        yield
+        return
+    try:
+        async with manager.normal_operation():
+            yield
+    except BatchJobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _rule_configuration(db: Session) -> list[dict[str, Any]]:
@@ -362,13 +382,16 @@ async def lifespan(app: FastAPI):
     hub = WebSocketHub()
     hub.set_loop(asyncio.get_running_loop())
     runtime = LiveRuntime(hub)
+    batch_jobs = BatchJobManager(runtime)
     app.state.hub = hub
     app.state.runtime = runtime
+    app.state.batch_jobs = batch_jobs
     app.state.started_at = datetime.now().astimezone()
     await runtime.start()
     try:
         yield
     finally:
+        batch_jobs.stop()
         runtime.stop()
 
 
@@ -422,47 +445,48 @@ def get_source(request: Request, db: Session = Depends(_get_db)):
 
 
 @app.patch("/api/source")
-def patch_source(
+async def patch_source(
     payload: SourcePatch, request: Request, db: Session = Depends(_get_db)
 ):
-    settings = db.get(SourceSettings, 1)
-    if settings is None:
-        settings = SourceSettings(
-            id=1,
-            source_type=payload.source_type,
-            active_video_id=None,
-            loop_enabled=True,
-        )
-        db.add(settings)
-        changed = True
-    else:
-        changed = settings.source_type != payload.source_type
-        settings.source_type = payload.source_type
-    db.commit()
-
-    if changed:
-        runtime: LiveRuntime = request.app.state.runtime
-        if payload.source_type == "insta360":
-            runtime.capture.select_source("insta360")
-        else:
-            video = (
-                db.get(Video, settings.active_video_id)
-                if settings.active_video_id is not None
-                else None
+    async with _batch_operation(request):
+        settings = db.get(SourceSettings, 1)
+        if settings is None:
+            settings = SourceSettings(
+                id=1,
+                source_type=payload.source_type,
+                active_video_id=None,
+                loop_enabled=True,
             )
-            if video is None:
-                settings.active_video_id = None
-                db.commit()
-                runtime.capture.select_empty_video(settings.loop_enabled)
+            db.add(settings)
+            changed = True
+        else:
+            changed = settings.source_type != payload.source_type
+            settings.source_type = payload.source_type
+        db.commit()
+
+        if changed:
+            runtime: LiveRuntime = request.app.state.runtime
+            if payload.source_type == "insta360":
+                runtime.capture.select_source("insta360")
             else:
-                runtime.capture.activate_video(
-                    video.id,
-                    VIDEOS_DIR / video.stored_filename,
-                    settings.loop_enabled,
-                    video.fps,
-                    video.duration_ms,
+                video = (
+                    db.get(Video, settings.active_video_id)
+                    if settings.active_video_id is not None
+                    else None
                 )
-    return _source_response(db, request.app.state.runtime)
+                if video is None:
+                    settings.active_video_id = None
+                    db.commit()
+                    runtime.capture.select_empty_video(settings.loop_enabled)
+                else:
+                    runtime.capture.activate_video(
+                        video.id,
+                        VIDEOS_DIR / video.stored_filename,
+                        settings.loop_enabled,
+                        video.fps,
+                        video.duration_ms,
+                    )
+        return _source_response(db, request.app.state.runtime)
 
 
 @app.get("/api/insta360")
@@ -471,50 +495,53 @@ def get_insta360(request: Request, db: Session = Depends(_get_db)):
 
 
 @app.patch("/api/insta360")
-def patch_insta360(
+async def patch_insta360(
     payload: Insta360SettingsPatch,
     request: Request,
     db: Session = Depends(_get_db),
 ):
-    settings = db.get(Insta360Settings, 1)
-    if settings is None:
-        settings = Insta360Settings(
-            id=1,
-            camera_ip="192.168.42.1",
-            tcp_port=6666,
-            reconnect_interval_ms=3000,
+    async with _batch_operation(request):
+        settings = db.get(Insta360Settings, 1)
+        if settings is None:
+            settings = Insta360Settings(
+                id=1,
+                camera_ip="192.168.42.1",
+                tcp_port=6666,
+                reconnect_interval_ms=3000,
+            )
+            db.add(settings)
+        values = payload.model_dump(exclude_unset=True)
+        if any(value is None for value in values.values()):
+            raise HTTPException(status_code=422, detail="Insta360 設定値に null は指定できません")
+        for key, value in values.items():
+            setattr(settings, key, value)
+        db.commit()
+        request.app.state.runtime.capture.configure_insta360(
+            settings.camera_ip,
+            settings.tcp_port,
+            settings.reconnect_interval_ms,
         )
-        db.add(settings)
-    values = payload.model_dump(exclude_unset=True)
-    if any(value is None for value in values.values()):
-        raise HTTPException(status_code=422, detail="Insta360 設定値に null は指定できません")
-    for key, value in values.items():
-        setattr(settings, key, value)
-    db.commit()
-    request.app.state.runtime.capture.configure_insta360(
-        settings.camera_ip,
-        settings.tcp_port,
-        settings.reconnect_interval_ms,
-    )
-    return _insta360_response(db, request.app.state.runtime)
+        return _insta360_response(db, request.app.state.runtime)
 
 
 @app.post("/api/insta360/connect")
-def connect_insta360(request: Request, db: Session = Depends(_get_db)):
-    source = db.get(SourceSettings, 1)
-    if source is None or source.source_type != "insta360":
-        raise HTTPException(status_code=409, detail="Insta360 入力が選択されていません")
-    request.app.state.runtime.capture.connect_insta360()
-    return _insta360_response(db, request.app.state.runtime)
+async def connect_insta360(request: Request, db: Session = Depends(_get_db)):
+    async with _batch_operation(request):
+        source = db.get(SourceSettings, 1)
+        if source is None or source.source_type != "insta360":
+            raise HTTPException(status_code=409, detail="Insta360 入力が選択されていません")
+        request.app.state.runtime.capture.connect_insta360()
+        return _insta360_response(db, request.app.state.runtime)
 
 
 @app.post("/api/insta360/disconnect")
-def disconnect_insta360(request: Request, db: Session = Depends(_get_db)):
-    source = db.get(SourceSettings, 1)
-    if source is None or source.source_type != "insta360":
-        raise HTTPException(status_code=409, detail="Insta360 入力が選択されていません")
-    request.app.state.runtime.capture.disconnect_insta360()
-    return _insta360_response(db, request.app.state.runtime)
+async def disconnect_insta360(request: Request, db: Session = Depends(_get_db)):
+    async with _batch_operation(request):
+        source = db.get(SourceSettings, 1)
+        if source is None or source.source_type != "insta360":
+            raise HTTPException(status_code=409, detail="Insta360 入力が選択されていません")
+        request.app.state.runtime.capture.disconnect_insta360()
+        return _insta360_response(db, request.app.state.runtime)
 
 
 @app.get("/api/videos")
@@ -586,51 +613,63 @@ async def upload_video(
     finally:
         capture.release()
 
+    registered = False
     try:
-        shutil.move(str(temporary_path), str(final_path))
-        video = Video(
-            name=Path(original_name).stem[:255] or original_name,
-            original_filename=original_name,
-            stored_filename=final_path.name,
-            file_size=size,
-            width=width,
-            height=height,
-            fps=fps,
-            duration_ms=duration_ms,
-        )
-        db.add(video)
-        db.flush()
-        settings = db.get(SourceSettings, 1)
-        if settings is None:
-            settings = SourceSettings(
-                id=1,
-                source_type="video",
-                active_video_id=video.id,
-                loop_enabled=True,
+        async with _batch_operation(request):
+            shutil.move(str(temporary_path), str(final_path))
+            video = Video(
+                name=Path(original_name).stem[:255] or original_name,
+                original_filename=original_name,
+                stored_filename=final_path.name,
+                file_size=size,
+                width=width,
+                height=height,
+                fps=fps,
+                duration_ms=duration_ms,
             )
-            db.add(settings)
-        settings.source_type = "video"
-        settings.active_video_id = video.id
-        db.commit()
-        db.refresh(video)
-        loop_enabled = settings.loop_enabled
+            db.add(video)
+            db.flush()
+            settings = db.get(SourceSettings, 1)
+            if settings is None:
+                settings = SourceSettings(
+                    id=1,
+                    source_type="video",
+                    active_video_id=video.id,
+                    loop_enabled=True,
+                )
+                db.add(settings)
+            settings.source_type = "video"
+            settings.active_video_id = video.id
+            db.commit()
+            registered = True
+            db.refresh(video)
+            loop_enabled = settings.loop_enabled
+            try:
+                request.app.state.runtime.capture.activate_video(
+                    video.id,
+                    VIDEOS_DIR / video.stored_filename,
+                    loop_enabled,
+                    video.fps,
+                    video.duration_ms,
+                )
+            except Exception as exc:
+                logger.exception("Video registered but could not be selected as input")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"動画は登録されましたが入力として選択できません: {exc}",
+                ) from exc
     except HTTPException:
         temporary_path.unlink(missing_ok=True)
-        final_path.unlink(missing_ok=True)
+        if not registered:
+            final_path.unlink(missing_ok=True)
         raise
     except Exception as exc:
         db.rollback()
         temporary_path.unlink(missing_ok=True)
-        final_path.unlink(missing_ok=True)
+        if not registered:
+            final_path.unlink(missing_ok=True)
         logger.exception("Could not register uploaded video")
         raise HTTPException(status_code=500, detail=f"動画を登録できません: {exc}") from exc
-    request.app.state.runtime.capture.activate_video(
-        video.id,
-        VIDEOS_DIR / video.stored_filename,
-        loop_enabled,
-        video.fps,
-        video.duration_ms,
-    )
     return _serialize_video(video, video.id)
 
 
@@ -643,95 +682,99 @@ def get_video(video_id: int, db: Session = Depends(_get_db)):
 
 
 @app.post("/api/videos/{video_id}/activate")
-def activate_video(video_id: int, request: Request, db: Session = Depends(_get_db)):
-    video = _get_or_404(db, Video, video_id, "動画")
-    settings = db.get(SourceSettings, 1)
-    if settings is None:
-        settings = SourceSettings(
-            id=1,
-            source_type="video",
-            active_video_id=video.id,
-            loop_enabled=True,
+async def activate_video(video_id: int, request: Request, db: Session = Depends(_get_db)):
+    async with _batch_operation(request):
+        video = _get_or_404(db, Video, video_id, "動画")
+        settings = db.get(SourceSettings, 1)
+        if settings is None:
+            settings = SourceSettings(
+                id=1,
+                source_type="video",
+                active_video_id=video.id,
+                loop_enabled=True,
+            )
+            db.add(settings)
+        settings.source_type = "video"
+        settings.active_video_id = video.id
+        db.commit()
+        request.app.state.runtime.capture.activate_video(
+            video.id,
+            VIDEOS_DIR / video.stored_filename,
+            settings.loop_enabled,
+            video.fps,
+            video.duration_ms,
         )
-        db.add(settings)
-    settings.source_type = "video"
-    settings.active_video_id = video.id
-    db.commit()
-    request.app.state.runtime.capture.activate_video(
-        video.id,
-        VIDEOS_DIR / video.stored_filename,
-        settings.loop_enabled,
-        video.fps,
-        video.duration_ms,
-    )
-    return get_video_playback(request, db)
+        return get_video_playback(request, db)
 
 
 @app.post("/api/videos/playback")
-def control_video_playback(
+async def control_video_playback(
     payload: PlaybackAction,
     request: Request,
     db: Session = Depends(_get_db),
 ):
-    settings = db.get(SourceSettings, 1)
-    if settings is None or settings.source_type != "video" or settings.active_video_id is None:
-        raise HTTPException(status_code=409, detail="再生する動画を選択してください")
-    try:
-        request.app.state.runtime.capture.playback(payload.action)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return get_video_playback(request, db)
+    async with _batch_operation(request):
+        settings = db.get(SourceSettings, 1)
+        if settings is None or settings.source_type != "video" or settings.active_video_id is None:
+            raise HTTPException(status_code=409, detail="再生する動画を選択してください")
+        try:
+            request.app.state.runtime.capture.playback(payload.action)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return get_video_playback(request, db)
 
 
 @app.patch("/api/videos/playback")
-def set_video_loop(payload: LoopPatch, request: Request, db: Session = Depends(_get_db)):
-    settings = db.get(SourceSettings, 1)
-    if settings is None:
-        settings = SourceSettings(
-            id=1,
-            source_type="video",
-            active_video_id=None,
-            loop_enabled=payload.loop,
-        )
-        db.add(settings)
-    settings.loop_enabled = payload.loop
-    db.commit()
-    request.app.state.runtime.capture.set_loop(payload.loop)
-    return get_video_playback(request, db)
+async def set_video_loop(payload: LoopPatch, request: Request, db: Session = Depends(_get_db)):
+    async with _batch_operation(request):
+        settings = db.get(SourceSettings, 1)
+        if settings is None:
+            settings = SourceSettings(
+                id=1,
+                source_type="video",
+                active_video_id=None,
+                loop_enabled=payload.loop,
+            )
+            db.add(settings)
+        settings.loop_enabled = payload.loop
+        db.commit()
+        request.app.state.runtime.capture.set_loop(payload.loop)
+        return get_video_playback(request, db)
 
 
 @app.delete("/api/videos/{video_id}")
-def delete_video(video_id: int, request: Request, db: Session = Depends(_get_db)):
-    video = _get_or_404(db, Video, video_id, "動画")
-    settings = db.get(SourceSettings, 1)
-    runtime: LiveRuntime = request.app.state.runtime
-    snapshot = runtime.source_snapshot()
-    if (
-        settings is not None
-        and settings.source_type == "video"
-        and settings.active_video_id == video_id
-        and snapshot["video_status"] == "playing"
-    ):
-        raise HTTPException(status_code=409, detail="再生中の動画は削除できません")
+async def delete_video(video_id: int, request: Request, db: Session = Depends(_get_db)):
+    async with _batch_operation(request):
+        video = _get_or_404(db, Video, video_id, "動画")
+        settings = db.get(SourceSettings, 1)
+        runtime: LiveRuntime = request.app.state.runtime
+        snapshot = runtime.source_snapshot()
+        if (
+            settings is not None
+            and settings.source_type == "video"
+            and settings.active_video_id == video_id
+            and snapshot["video_status"] == "playing"
+        ):
+            raise HTTPException(status_code=409, detail="再生中の動画は削除できません")
 
-    if settings is not None and settings.active_video_id == video_id:
-        settings.active_video_id = None
-        if settings.source_type == "video":
+        if settings is not None and settings.active_video_id == video_id:
+            settings.active_video_id = None
+            if settings.source_type == "video":
+                try:
+                    runtime.capture.clear_video(video_id, settings.loop_enabled)
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        stored_path = VIDEOS_DIR / video.stored_filename
+        if stored_path.exists():
             try:
-                runtime.capture.clear_video(video_id, settings.loop_enabled)
-            except RuntimeError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    stored_path = VIDEOS_DIR / video.stored_filename
-    if stored_path.exists():
-        try:
-            stored_path.unlink()
-        except OSError as exc:
-            logger.exception("Could not remove video file")
-            raise HTTPException(status_code=500, detail=f"動画ファイルを削除できません: {exc}") from exc
-    db.delete(video)
-    db.commit()
-    return {"deleted": True, "id": video_id}
+                stored_path.unlink()
+            except OSError as exc:
+                logger.exception("Could not remove video file")
+                raise HTTPException(status_code=500, detail=f"動画ファイルを削除できません: {exc}") from exc
+        db.delete(video)
+        db.commit()
+        return {"deleted": True, "id": video_id}
 
 
 @app.get("/api/models")
@@ -831,56 +874,61 @@ def get_model(model_id: int, request: Request, db: Session = Depends(_get_db)):
 
 @app.post("/api/models/{model_id}/activate")
 async def activate_model(model_id: int, request: Request, db: Session = Depends(_get_db)):
-    model = db.scalars(
-        select(ModelRecord)
-        .options(selectinload(ModelRecord.classes))
-        .where(ModelRecord.id == model_id)
-    ).first()
-    if model is None:
-        raise HTTPException(status_code=404, detail="モデルが見つかりません")
-    model_path = MODELS_DIR / model.stored_filename
-    runtime: LiveRuntime = request.app.state.runtime
-    def persist_active_model() -> None:
-        settings = db.get(ModelSettings, 1)
-        if settings is None:
-            settings = ModelSettings(id=1)
-            db.add(settings)
-        settings.active_model_id = model.id
-        db.commit()
+    async with _batch_operation(request):
+        model = db.scalars(
+            select(ModelRecord)
+            .options(selectinload(ModelRecord.classes))
+            .where(ModelRecord.id == model_id)
+        ).first()
+        if model is None:
+            raise HTTPException(status_code=404, detail="モデルが見つかりません")
+        model_path = MODELS_DIR / model.stored_filename
+        runtime: LiveRuntime = request.app.state.runtime
 
-    try:
-        await runtime.activate_model(
-            model_path,
-            model.id,
-            model.name,
-            persist_active_model,
-        )
-    except CUDAUnavailableError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ModelValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception("Could not activate model")
-        raise HTTPException(status_code=422, detail=f"モデルを読み込めません: {exc}") from exc
-    return _serialize_model(model, model.id, model.id)
+        def persist_active_model() -> None:
+            settings = db.get(ModelSettings, 1)
+            if settings is None:
+                settings = ModelSettings(id=1)
+                db.add(settings)
+            settings.active_model_id = model.id
+            db.commit()
+
+        try:
+            await runtime.activate_model(
+                model_path,
+                model.id,
+                model.name,
+                persist_active_model,
+            )
+        except CUDAUnavailableError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Could not activate model")
+            raise HTTPException(status_code=422, detail=f"モデルを読み込めません: {exc}") from exc
+        return _serialize_model(model, model.id, model.id)
 
 
 @app.delete("/api/models/{model_id}")
-def delete_model(model_id: int, db: Session = Depends(_get_db)):
-    model = _get_or_404(db, ModelRecord, model_id, "モデル")
-    settings = db.get(ModelSettings, 1)
-    if settings is not None and settings.active_model_id == model_id:
-        raise HTTPException(status_code=409, detail="使用中のモデルは削除できません")
-    stored_path = MODELS_DIR / model.stored_filename
-    if stored_path.exists():
-        try:
-            stored_path.unlink()
-        except OSError as exc:
-            logger.exception("Could not remove model file")
-            raise HTTPException(status_code=500, detail=f"モデルファイルを削除できません: {exc}") from exc
-    db.delete(model)
-    db.commit()
-    return {"deleted": True, "id": model_id}
+async def delete_model(
+    model_id: int, request: Request, db: Session = Depends(_get_db)
+):
+    async with _batch_operation(request):
+        model = _get_or_404(db, ModelRecord, model_id, "モデル")
+        settings = db.get(ModelSettings, 1)
+        if settings is not None and settings.active_model_id == model_id:
+            raise HTTPException(status_code=409, detail="使用中のモデルは削除できません")
+        stored_path = MODELS_DIR / model.stored_filename
+        if stored_path.exists():
+            try:
+                stored_path.unlink()
+            except OSError as exc:
+                logger.exception("Could not remove model file")
+                raise HTTPException(status_code=500, detail=f"モデルファイルを削除できません: {exc}") from exc
+        db.delete(model)
+        db.commit()
+        return {"deleted": True, "id": model_id}
 
 
 @app.get("/api/classes")
@@ -1054,12 +1102,16 @@ def delete_rule(rule_id: int, request: Request, db: Session = Depends(_get_db)):
 def list_alerts(
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    batch_job_id: int | None = Query(default=None, ge=1),
     db: Session = Depends(_get_db),
 ):
+    statement = select(AlertEvent).options(
+        selectinload(AlertEvent.frame).defer(AlertFrame.image_jpeg)
+    )
+    if batch_job_id is not None:
+        statement = statement.where(AlertEvent.batch_job_id == batch_job_id)
     records = db.scalars(
-        select(AlertEvent)
-        .options(selectinload(AlertEvent.frame))
-        .order_by(AlertEvent.created_at.desc(), AlertEvent.id.desc())
+        statement.order_by(AlertEvent.created_at.desc(), AlertEvent.id.desc())
         .offset(offset)
         .limit(limit)
     ).all()
@@ -1067,14 +1119,19 @@ def list_alerts(
         "items": [
             {
                 "id": event.id,
+                "batch_job_id": event.batch_job_id,
                 "rule_id": event.rule_id,
                 "model_id": event.model_id,
+                "hazard_reason_id": event.hazard_reason_id,
                 "rule_name": event.rule_name_snapshot,
                 "detected_classes": json.loads(event.detected_classes_json),
                 "event_type": event.event_type,
                 "source_type": event.source_type,
                 "video_id": event.video_id,
                 "media_time_ms": event.media_time_ms,
+                "correct_reason": event.quiz_correct_reason_snapshot,
+                "wrong_reason": event.quiz_wrong_reason_snapshot,
+                "explanation": event.quiz_explanation_snapshot,
                 "model_name": (
                     event.frame.model_name_snapshot if event.frame is not None else None
                 ),
@@ -1088,6 +1145,86 @@ def list_alerts(
         "limit": limit,
         "offset": offset,
     }
+
+
+@app.post("/api/batch-jobs", status_code=202)
+async def create_batch_job(
+    payload: BatchJobCreatePayload,
+    request: Request,
+    db: Session = Depends(_get_db),
+):
+    manager: BatchJobManager = request.app.state.batch_jobs
+    try:
+        return await manager.submit(
+            db,
+            payload.video_ids,
+            lambda: _rule_configuration(db),
+        )
+    except BatchJobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Could not create batch inference job")
+        raise HTTPException(
+            status_code=500,
+            detail=f"一括推論ジョブを開始できません: {exc}",
+        ) from exc
+
+
+@app.get("/api/batch-jobs")
+def list_batch_jobs(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(_get_db),
+):
+    jobs = db.scalars(
+        select(BatchJob)
+        .order_by(BatchJob.created_at.desc(), BatchJob.id.desc())
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    return [serialize_batch_job(job, include_details=False) for job in jobs]
+
+
+@app.get("/api/batch-jobs/{job_id}")
+def get_batch_job(job_id: int, db: Session = Depends(_get_db)):
+    job = db.scalar(
+        select(BatchJob)
+        .options(selectinload(BatchJob.videos))
+        .where(BatchJob.id == job_id)
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="一括推論ジョブが見つかりません")
+    return serialize_batch_job(job)
+
+
+@app.post("/api/batch-jobs/{job_id}/cancel")
+def cancel_batch_job(job_id: int, request: Request, db: Session = Depends(_get_db)):
+    job = db.scalar(
+        select(BatchJob)
+        .options(selectinload(BatchJob.videos))
+        .where(BatchJob.id == job_id)
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="一括推論ジョブが見つかりません")
+    if job.status not in {"pending", "running"}:
+        raise HTTPException(status_code=409, detail="このジョブはキャンセルできません")
+    manager: BatchJobManager = request.app.state.batch_jobs
+    if not manager.request_cancel(job_id):
+        raise HTTPException(status_code=409, detail="ジョブはすでに実行されていません")
+    return serialize_batch_job(job)
+
+
+@app.get("/api/batch-jobs/{job_id}/alerts")
+def list_batch_job_alerts(
+    job_id: int,
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(_get_db),
+):
+    if db.get(BatchJob, job_id) is None:
+        raise HTTPException(status_code=404, detail="一括推論ジョブが見つかりません")
+    return list_alerts(limit=limit, offset=offset, batch_job_id=job_id, db=db)
 
 
 @app.get("/api/alerts/{alert_id}")
@@ -1104,6 +1241,7 @@ def get_alert(alert_id: int, db: Session = Depends(_get_db)):
     frame = event.frame
     return {
         "id": event.id,
+        "batch_job_id": event.batch_job_id,
         "rule_id": event.rule_id,
         "rule_name": event.rule_name_snapshot,
         "detected_classes": json.loads(event.detected_classes_json),
@@ -1183,19 +1321,20 @@ def get_alert_frame(alert_id: int, db: Session = Depends(_get_db)):
 
 
 @app.delete("/api/alerts")
-def delete_alerts(db: Session = Depends(_get_db)):
-    db.execute(delete(AlertEvent))
-    unreferenced_frame_ids = select(AlertFrame.id).where(
-        ~exists(select(AlertEvent.id).where(AlertEvent.alert_frame_id == AlertFrame.id))
-    )
-    db.execute(
-        delete(AlertFrameDetection).where(
-            AlertFrameDetection.alert_frame_id.in_(unreferenced_frame_ids)
+async def delete_alerts(request: Request, db: Session = Depends(_get_db)):
+    async with _batch_operation(request):
+        db.execute(delete(AlertEvent))
+        unreferenced_frame_ids = select(AlertFrame.id).where(
+            ~exists(select(AlertEvent.id).where(AlertEvent.alert_frame_id == AlertFrame.id))
         )
-    )
-    db.execute(delete(AlertFrame).where(AlertFrame.id.in_(unreferenced_frame_ids)))
-    db.commit()
-    return {"deleted": True}
+        db.execute(
+            delete(AlertFrameDetection).where(
+                AlertFrameDetection.alert_frame_id.in_(unreferenced_frame_ids)
+            )
+        )
+        db.execute(delete(AlertFrame).where(AlertFrame.id.in_(unreferenced_frame_ids)))
+        db.commit()
+        return {"deleted": True}
 
 
 @app.post("/api/alerts/test")
@@ -1261,52 +1400,62 @@ async def patch_settings(
         return get_settings(request, db)
     if any(value is None for value in values.values()):
         raise HTTPException(status_code=422, detail="設定値に null は指定できません")
-    model_values = {
-        key: values[key]
-        for key in ("confidence", "iou_threshold", "imgsz", "target_fps")
-        if key in values
-    }
-    settings = db.get(ModelSettings, 1)
-    if settings is None:
-        settings = ModelSettings(id=1)
-        db.add(settings)
     requested_device = values.get("requested_device")
-    current_device = request.app.state.runtime.requested_device
-    if requested_device is not None:
-        settings.requested_device = requested_device
-    for key, value in model_values.items():
-        setattr(settings, key, value)
-    app_setting_keys = (
-        "show_boxes",
-        "show_labels",
-        "show_confidence",
-        "audio_enabled",
-        "jpeg_quality",
-    )
-    for key in app_setting_keys:
-        if key in values:
-            _set_app_setting(db, key, values[key])
     runtime: LiveRuntime = request.app.state.runtime
-    if requested_device is not None and requested_device != current_device:
-        try:
-            await runtime.switch_device(requested_device, db.commit)
-        except CUDAUnavailableError as exc:
-            db.rollback()
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except Exception as exc:
-            db.rollback()
-            logger.exception("Could not switch inference device")
-            raise HTTPException(
-                status_code=422,
-                detail=f"推論デバイスを切り替えられません: {exc}",
-            ) from exc
-    else:
-        db.commit()
-    inference_values = dict(model_values)
-    if "jpeg_quality" in values:
-        inference_values["jpeg_quality"] = values["jpeg_quality"]
-    runtime.set_inference_settings(inference_values)
-    return get_settings(request, db)
+    device_switch = (
+        requested_device is not None
+        and requested_device != runtime.requested_device
+    )
+
+    async def apply_settings() -> dict[str, Any]:
+        model_values = {
+            key: values[key]
+            for key in ("confidence", "iou_threshold", "imgsz", "target_fps")
+            if key in values
+        }
+        settings = db.get(ModelSettings, 1)
+        if settings is None:
+            settings = ModelSettings(id=1)
+            db.add(settings)
+        if requested_device is not None:
+            settings.requested_device = requested_device
+        for key, value in model_values.items():
+            setattr(settings, key, value)
+        app_setting_keys = (
+            "show_boxes",
+            "show_labels",
+            "show_confidence",
+            "audio_enabled",
+            "jpeg_quality",
+        )
+        for key in app_setting_keys:
+            if key in values:
+                _set_app_setting(db, key, values[key])
+        if device_switch:
+            try:
+                await runtime.switch_device(requested_device, db.commit)
+            except CUDAUnavailableError as exc:
+                db.rollback()
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except Exception as exc:
+                db.rollback()
+                logger.exception("Could not switch inference device")
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"推論デバイスを切り替えられません: {exc}",
+                ) from exc
+        else:
+            db.commit()
+        inference_values = dict(model_values)
+        if "jpeg_quality" in values:
+            inference_values["jpeg_quality"] = values["jpeg_quality"]
+        runtime.set_inference_settings(inference_values)
+        return get_settings(request, db)
+
+    if device_switch:
+        async with _batch_operation(request):
+            return await apply_settings()
+    return await apply_settings()
 
 
 @app.websocket("/ws/live")

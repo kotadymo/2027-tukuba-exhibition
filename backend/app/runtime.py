@@ -549,6 +549,7 @@ class CaptureController:
                 "camera_ip": self._camera_ip,
                 "tcp_port": self._tcp_port,
                 "reconnect_interval_ms": self._reconnect_interval_ms,
+                "connect_requested": self._connect_requested,
                 "insta360_status": self._insta360_status,
                 "insta360_error": self._insta360_error,
                 "last_frame_received_at": self._last_frame_received_at,
@@ -982,6 +983,10 @@ class InferenceWorker:
     def current_model_generation(self) -> int:
         with self._lock:
             return self._model_generation
+
+    def current_detector(self) -> Detector | None:
+        with self._lock:
+            return self._detector
 
     def _run(self) -> None:
         next_inference_at = 0.0
@@ -1435,6 +1440,20 @@ class LiveRuntime:
                 **self.inference.metrics(),
             }
 
+    def batch_runtime_status(self) -> dict[str, Any]:
+        with self._device_lock:
+            return {
+                "model_id": self.active_model_id,
+                "model_name": self.active_model_name,
+                "model_loaded": self.model_loaded,
+                "requested_device": self.requested_device,
+                "effective_device": self.effective_device,
+                "fallback_reason": self.fallback_reason,
+                "transition_pending": (
+                    self._transition_pending or self._transition_lock.locked()
+                ),
+            }
+
     def _publish_device_changed(self) -> None:
         self.hub.publish_event(
             {"type": "device_changed", **self.get_device_status()}
@@ -1594,6 +1613,66 @@ class LiveRuntime:
                 self._handle_cuda_failure(str(error), model_generation)
             )
         )
+
+    def fallback_to_cpu_for_batch(
+        self,
+        error_message: str,
+    ) -> tuple[Detector, str]:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            raise RuntimeError("CUDAフォールバックを実行するBackendイベントループがありません")
+        future = asyncio.run_coroutine_threadsafe(
+            self._fallback_to_cpu_for_batch(error_message),
+            loop,
+        )
+        return future.result()
+
+    async def _fallback_to_cpu_for_batch(
+        self,
+        error_message: str,
+    ) -> tuple[Detector, str]:
+        async with self._transition_lock:
+            with self._device_lock:
+                if self.requested_device != "auto":
+                    raise RuntimeError("Auto以外の推論モードではCPUへ自動切替しません")
+                if self._model_path is None or self.active_model_id is None:
+                    raise RuntimeError("CPUフォールバック用のモデル情報がありません")
+                model_path = self._model_path
+                model_id = self.active_model_id
+                model_name = self.active_model_name or ""
+                self._transition_pending = True
+            try:
+                await asyncio.to_thread(self.inference.pause)
+                reason = (
+                    "一括推論中にCUDA推論に失敗したためCPUへ切り替えました: "
+                    f"{error_message}"
+                )
+                try:
+                    detector = await asyncio.to_thread(
+                        Detector.load,
+                        model_path,
+                        "cpu",
+                    )
+                except Exception as exc:
+                    self._disable_after_cuda_error(
+                        f"{reason} CPUへの切り替えにも失敗しました: {exc}",
+                        "cuda_fallback_failed",
+                    )
+                    raise RuntimeError(
+                        f"一括推論のCPUフォールバックに失敗しました: {exc}"
+                    ) from exc
+                self._install_detector(
+                    detector,
+                    model_id,
+                    model_name,
+                    model_path,
+                    "cpu",
+                    reason,
+                )
+                return detector, reason
+            finally:
+                with self._device_lock:
+                    self._transition_pending = False
 
     async def _handle_cuda_failure(
         self,

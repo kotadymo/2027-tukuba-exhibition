@@ -126,6 +126,19 @@ class QuizGeneratePayload(BaseModel):
     max_questions: int = Field(default=3, ge=1, le=3)
 
 
+class BatchJobCreatePayload(BaseModel):
+    video_ids: list[int] = Field(min_length=1)
+
+    @field_validator("video_ids")
+    @classmethod
+    def validate_video_ids(cls, values: list[int]) -> list[int]:
+        if any(video_id < 1 for video_id in values):
+            raise ValueError("動画IDは1以上を指定してください")
+        if len(set(values)) != len(values):
+            raise ValueError("同じ動画を複数回指定できません")
+        return values
+
+
 class SettingsPatch(BaseModel):
     requested_device: Literal["auto", "cuda", "cpu"] | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)

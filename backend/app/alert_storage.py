@@ -33,6 +33,7 @@ def persist_alert_frame_events(
     height: int,
     image_jpeg: bytes,
     detections: list[Detection],
+    batch_job_id: int | None = None,
 ) -> list[dict[str, Any]]:
     frame = db.scalars(
         select(AlertFrame).where(
@@ -90,6 +91,7 @@ def persist_alert_frame_events(
             height,
         )
         record = AlertEvent(
+            batch_job_id=batch_job_id,
             alert_frame_id=frame.id,
             rule_id=event["rule_id"],
             model_id=model_id,
